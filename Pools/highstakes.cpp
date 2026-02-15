@@ -152,6 +152,9 @@ struct Settings
     int ocrBlackoutAnchorGraceMs = 6000; // keep poker state if anchors were seen recently
     int ocrBlackoutOutExtraMs = 2500;  // extra OUT_OF_POKER stable time during fade
     int ocrBlackoutMaxHoldMs = 2500;   // max extra hold time before allowing OUT transition
+    int ocrPayoutGuardEnable = 1;      // 1=hold in-poker during winner payout collection pauses
+    int ocrPayoutMarkerGraceMs = 9000; // recent payout marker window to apply hold logic
+    int ocrPayoutOutExtraMs = 5000;    // extra OUT stable time while payout marker grace is active
     std::string ocrPlayerNameHint = "arthur"; // lowercase token used to pick player row amount from OCR
     std::string ocrTesseractPath = "tesseract";
     std::string ocrKeywords = "poker,ante,call,fold,raise,check,bet,pot,blind,cards,community,turn";
@@ -174,13 +177,17 @@ struct Settings
     int moneyLogTopN = 5;               // top changing candidates to log
     int moneyLogOnlyOnChange = 1;       // 1=skip repeated snapshots when nothing meaningful changed
     float moneyLikelyMaxChangesPerSec = 1.5f; // treat faster-changing candidates as noise
+    int moneyBetStepFilterEnable = 1;   // 1=prefer candidates whose deltas follow table bet increments
+    int moneyBetStepDollars = 5;        // legal bet increment (Saint Denis high-stakes: 5)
+    int moneyBetMinDollars = 10;        // smallest legal bet change (Saint Denis high-stakes: 10)
     int moneyExceptionLogCooldownMs = 30000; // SEH warning cooldown (0=log once per scan)
     int moneySkipFaultRuns = 1;         // 1=skip ahead after contiguous SEH faults
     int moneyOcrMatchToleranceCents = 6; // max abs delta to treat candidate as matching OCR amount
+    int moneyNpcTrackMax = 5;           // max OCR-derived NPC amounts tracked per sample
     int moneyAutoLockPot = 1;           // 1=auto-lock pot global from OCR-correlated candidates
-    int moneyAutoLockPotMinMatches = 6; // minimum OCR pot matches before auto-locking
+    int moneyAutoLockPotMinMatches = 10; // minimum OCR pot matches before auto-locking
     int moneyAutoLockPlayer = 1;        // 1=auto-lock player stack global from OCR-correlated candidates
-    int moneyAutoLockPlayerMinMatches = 6; // minimum OCR player matches before auto-locking
+    int moneyAutoLockPlayerMinMatches = 8; // minimum OCR player matches before auto-locking
     float moneyOverlayMultiplier = 2.0f; // multiplier shown in overlay
     int moneyPayoutEnable = 0;          // 1=auto payout bonus during payout phase
     float moneyPayoutMultiplier = 2.0f; // payout multiplier; bonus = src*(multiplier-1)
@@ -200,6 +207,7 @@ struct Settings
 };
 
 static Settings gCfg;
+static char gGameDirPath[MAX_PATH]{ 0 };
 static char gIniPath[MAX_PATH]{ 0 };
 static char gLogPath[MAX_PATH]{ 0 };
 
@@ -338,13 +346,18 @@ struct MoneyCandidate
 {
     int idx = -1;
     int last = 0;
+    int lastDelta = 0;
     int changes = 0;
+    int betStepMatches = 0;
+    int betStepMismatches = 0;
     int ocrAnyMatches = 0;
     int ocrPotMatches = 0;
     int ocrPlayerMatches = 0;
+    int ocrNpcMatches = 0;
     int lastOcrAnySampleId = -1;
     int lastOcrPotSampleId = -1;
     int lastOcrPlayerSampleId = -1;
+    int lastOcrNpcSampleId = -1;
     DWORD firstSeenMs = 0;
     DWORD lastSeenMs = 0;
     DWORD lastChangeMs = 0;
@@ -377,6 +390,7 @@ struct OcrMoneySnapshot
     int genericPotCents = -1;
     int winsCents = -1;
     int playerCents = -1;
+    std::vector<int> npcAmountsCents;
     int potSource = 0; // 0=none,1=main+side,2=main,3=side,4=genericPot,5=maxFallback
     std::vector<int> amountsCents;
 };
@@ -396,6 +410,16 @@ static void SortUniqueIntVector(std::vector<int>& vals)
 {
     std::sort(vals.begin(), vals.end());
     vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
+}
+
+static bool AmountMatchesRefWithTol(int amountCents, int refCents, int tolCents)
+{
+    if (amountCents <= 0 || refCents <= 0)
+        return false;
+    int diff = amountCents - refCents;
+    if (diff < 0)
+        diff = -diff;
+    return diff <= tolCents;
 }
 
 static bool ParseMoneyTokenCents(const std::string& token, int& outCents)
@@ -450,43 +474,41 @@ static bool ParseMoneyTokenCents(const std::string& token, int& outCents)
         long long raw = _atoi64(token.c_str());
         long long asCents = raw;
         long long asDollars = raw * 100ll;
+        long long hint = -1;
+        if (gOcrMoney.winsCents > 0)
+            hint = gOcrMoney.winsCents;
+        else if (gOcrMoney.potCents > 0)
+            hint = gOcrMoney.potCents;
 
-        // OCR often drops decimal separators. For ambiguous 3-4 digit tokens,
-        // prefer the interpretation closer to recent OCR pot/wins values.
+        // OCR often drops decimal separators. Be conservative for 3+ digit tokens
+        // to avoid catastrophic "$8.55" -> "$855.00" promotions.
         if (token.size() <= 2)
         {
             cents = asDollars;
         }
-        else
+        else if (token.size() == 3)
         {
-            bool choseWithHint = false;
-            long long hint = -1;
-            if (gOcrMoney.winsCents > 0)
-                hint = gOcrMoney.winsCents;
-            else if (gOcrMoney.potCents > 0)
-                hint = gOcrMoney.potCents;
-
-            if (hint > 0 && token.size() <= 4)
+            // Default to cent-form (e.g. 855 -> $8.55). Only allow dollar-form
+            // if a recent hint strongly supports it and remains close in magnitude.
+            cents = asCents;
+            if (hint > 0)
             {
                 long long diffC = (asCents > hint) ? (asCents - hint) : (hint - asCents);
                 long long diffD = (asDollars > hint) ? (asDollars - hint) : (hint - asDollars);
-                cents = (diffD < diffC) ? asDollars : asCents;
-                choseWithHint = true;
+                if (diffD + 200 < diffC && asDollars <= (hint * 3ll + 10000ll))
+                    cents = asDollars;
             }
-
-            if (!choseWithHint)
+        }
+        else
+        {
+            // 4+ digits without separators are usually cent-formatted in OCR rows.
+            cents = asCents;
+            if (hint > 0 && token.size() == 4)
             {
-                if (token.size() == 3)
-                {
-                    // 3-digit tokens are highly ambiguous:
-                    // e.g. 460 is often 4.60 (cents), while 106 can be 106.00.
-                    cents = ((raw % 10ll) == 0ll) ? asCents : asDollars;
-                }
-                else
-                {
-                    // 4+ digits without separators are usually cent-formatted.
-                    cents = asCents;
-                }
+                long long diffC = (asCents > hint) ? (asCents - hint) : (hint - asCents);
+                long long diffD = (asDollars > hint) ? (asDollars - hint) : (hint - asDollars);
+                if (diffD + 300 < diffC && asDollars <= (hint * 4ll + 20000ll))
+                    cents = asDollars;
             }
         }
     }
@@ -631,6 +653,114 @@ static int FindDollarAmountAfterToken(const std::string& text, const char* token
     return best;
 }
 
+static int FindDollarAmountBeforeToken(const std::string& text, const char* token, size_t lookbackMax, bool chooseMax)
+{
+    if (!token || !*token)
+        return -1;
+    std::string needle = token;
+    int best = -1;
+
+    size_t pos = 0;
+    while (true)
+    {
+        pos = text.find(needle, pos);
+        if (pos == std::string::npos)
+            break;
+
+        size_t begin = (pos > lookbackMax) ? (pos - lookbackMax) : 0;
+        size_t dollar = text.rfind('$', pos);
+        if (dollar != std::string::npos && dollar >= begin && dollar < pos)
+        {
+            int cents = 0;
+            if (ParseAmountAfterDollar(text, dollar, cents))
+            {
+                if (!chooseMax)
+                    return cents;
+                if (cents > best)
+                    best = cents;
+            }
+        }
+        pos += needle.size();
+    }
+
+    return best;
+}
+
+static int FindDollarAmountNearToken(const std::string& text, const char* token, size_t lookaheadMax, size_t lookbackMax)
+{
+    int after = FindDollarAmountAfterToken(text, token, lookaheadMax, false);
+    if (after > 0)
+        return after;
+    return FindDollarAmountBeforeToken(text, token, lookbackMax, false);
+}
+
+static bool WindowContainsToken(const std::string& text, size_t begin, size_t end, const char* token)
+{
+    if (!token || !*token || begin >= end || begin >= text.size())
+        return false;
+    size_t clampedEnd = (std::min)(end, text.size());
+    size_t at = text.find(token, begin);
+    return at != std::string::npos && at < clampedEnd;
+}
+
+static bool WindowHasCommaName(const std::string& text, size_t begin, size_t end)
+{
+    if (begin >= end || begin >= text.size())
+        return false;
+    size_t clampedEnd = (std::min)(end, text.size());
+    size_t comma = text.find(',', begin);
+    while (comma != std::string::npos && comma < clampedEnd)
+    {
+        size_t j = comma + 1;
+        while (j < clampedEnd && text[j] == ' ')
+            j++;
+        int letters = 0;
+        while (j < clampedEnd && text[j] >= 'a' && text[j] <= 'z')
+        {
+            letters++;
+            j++;
+        }
+        if (letters >= 3)
+            return true;
+        comma = text.find(',', comma + 1);
+    }
+    return false;
+}
+
+static bool IsLikelyNpcAmountContext(const std::string& text, size_t dollarPos, const std::string& playerNameHint)
+{
+    if (dollarPos >= text.size() || text[dollarPos] != '$')
+        return false;
+
+    size_t begin = (dollarPos > 22) ? (dollarPos - 22) : 0;
+    size_t end = (std::min)(text.size(), dollarPos + 42);
+
+    // Reject action/pot/win contexts that are commonly misread as seat rows.
+    const char* rejectTokens[] = {
+        "pot", "main pot", "side pot", "wins", "winner", "collect",
+        "blind", "called", "check", "checked", "bet", "raised", "raise", "fold", "turn"
+    };
+    for (const char* tok : rejectTokens)
+    {
+        if (WindowContainsToken(text, begin, end, tok))
+            return false;
+    }
+
+    if (!playerNameHint.empty() && WindowContainsToken(text, begin, end, playerNameHint.c_str()))
+        return false;
+    if (WindowContainsToken(text, begin, end, "you"))
+        return false;
+
+    if (WindowContainsToken(text, begin, end, "oc,") ||
+        WindowContainsToken(text, begin, end, "0c,") ||
+        WindowContainsToken(text, begin, end, "qc,"))
+    {
+        return true;
+    }
+
+    return WindowHasCommaName(text, begin, end);
+}
+
 static void UpdateOcrMoneySnapshot(const std::string& rawText, DWORD now)
 {
     gOcrMoney.sampleId++;
@@ -642,7 +772,9 @@ static void UpdateOcrMoneySnapshot(const std::string& rawText, DWORD now)
     gOcrMoney.genericPotCents = -1;
     gOcrMoney.winsCents = -1;
     gOcrMoney.playerCents = -1;
+    gOcrMoney.npcAmountsCents.clear();
     gOcrMoney.potSource = 0;
+    std::unordered_map<int, int> npcContextHits;
 
     for (size_t i = 0; i < rawText.size(); i++)
     {
@@ -650,18 +782,31 @@ static void UpdateOcrMoneySnapshot(const std::string& rawText, DWORD now)
             continue;
         int cents = 0;
         if (ParseAmountAfterDollar(rawText, i, cents))
+        {
             gOcrMoney.amountsCents.push_back(cents);
+            if (IsLikelyNpcAmountContext(rawText, i, gCfg.ocrPlayerNameHint))
+                npcContextHits[cents]++;
+        }
     }
     SortUniqueIntVector(gOcrMoney.amountsCents);
 
     gOcrMoney.mainPotCents = FindDollarAmountAfterToken(rawText, "main pot", 36, false);
     gOcrMoney.sidePotCents = FindDollarAmountAfterToken(rawText, "side pot", 36, false);
     gOcrMoney.genericPotCents = FindDollarAmountAfterToken(rawText, "pot", 28, true);
-    gOcrMoney.winsCents = FindDollarAmountAfterToken(rawText, "wins", 32, false);
+    gOcrMoney.winsCents = FindDollarAmountNearToken(rawText, "wins", 36, 18);
+    if (gOcrMoney.winsCents <= 0)
+        gOcrMoney.winsCents = FindDollarAmountNearToken(rawText, "won", 20, 10);
+    if (gOcrMoney.winsCents <= 0)
+        gOcrMoney.winsCents = FindDollarAmountNearToken(rawText, "collected", 32, 10);
+    if (gOcrMoney.winsCents <= 0)
+        gOcrMoney.winsCents = FindDollarAmountNearToken(rawText, "collect", 24, 10);
+    if (gOcrMoney.winsCents <= 0)
+        gOcrMoney.winsCents = FindDollarAmountNearToken(rawText, "winner", 30, 10);
+
     if (!gCfg.ocrPlayerNameHint.empty())
-        gOcrMoney.playerCents = FindDollarAmountAfterToken(rawText, gCfg.ocrPlayerNameHint.c_str(), 40, false);
+        gOcrMoney.playerCents = FindDollarAmountNearToken(rawText, gCfg.ocrPlayerNameHint.c_str(), 40, 28);
     if (gOcrMoney.playerCents <= 0)
-        gOcrMoney.playerCents = FindDollarAmountAfterToken(rawText, "you", 24, false);
+        gOcrMoney.playerCents = FindDollarAmountNearToken(rawText, "you", 28, 20);
 
     if (gOcrMoney.mainPotCents > 0 && gOcrMoney.sidePotCents > 0)
     {
@@ -690,8 +835,50 @@ static void UpdateOcrMoneySnapshot(const std::string& rawText, DWORD now)
         gOcrMoney.potCents = gOcrMoney.amountsCents.back();
         gOcrMoney.potSource = 5;
     }
-    if (gOcrMoney.winsCents <= 0 && rawText.find("wins") != std::string::npos && !gOcrMoney.amountsCents.empty())
-        gOcrMoney.winsCents = gOcrMoney.amountsCents.back();
+
+    // Candidate NPC stack amounts are OCR dollars excluding known pot/player/wins references.
+    {
+        int tol = (std::max)(0, gCfg.moneyOcrMatchToleranceCents);
+        int refs[6] = {
+            gOcrMoney.potCents,
+            gOcrMoney.mainPotCents,
+            gOcrMoney.sidePotCents,
+            gOcrMoney.genericPotCents,
+            gOcrMoney.winsCents,
+            gOcrMoney.playerCents
+        };
+        for (int amount : gOcrMoney.amountsCents)
+        {
+            if (amount <= 0)
+                continue;
+            if (amount < gCfg.moneyValueMin || amount > gCfg.moneyValueMax)
+                continue;
+            auto itCtx = npcContextHits.find(amount);
+            if (itCtx == npcContextHits.end() || itCtx->second <= 0)
+                continue;
+
+            bool reserved = false;
+            for (int ref : refs)
+            {
+                if (AmountMatchesRefWithTol(amount, ref, tol))
+                {
+                    reserved = true;
+                    break;
+                }
+            }
+            if (!reserved)
+                gOcrMoney.npcAmountsCents.push_back(amount);
+        }
+        SortUniqueIntVector(gOcrMoney.npcAmountsCents);
+
+        int keep = gCfg.moneyNpcTrackMax;
+        if (keep > 0 && (int)gOcrMoney.npcAmountsCents.size() > keep)
+        {
+            gOcrMoney.npcAmountsCents.erase(
+                gOcrMoney.npcAmountsCents.begin(),
+                gOcrMoney.npcAmountsCents.end() - keep);
+        }
+    }
 }
 
 static bool CandidateMatchesObservedOcrAmount(int value, int amountCents)
@@ -699,10 +886,23 @@ static bool CandidateMatchesObservedOcrAmount(int value, int amountCents)
     if (amountCents <= 0)
         return false;
     int tol = (std::max)(0, gCfg.moneyOcrMatchToleranceCents);
-    int diff = value - amountCents;
-    if (diff < 0)
-        diff = -diff;
-    return diff <= tol;
+
+    // Primary: global appears to be cent-based (value and OCR amount are both cents).
+    long long diffDirect = (long long)value - (long long)amountCents;
+    if (diffDirect < 0)
+        diffDirect = -diffDirect;
+    if (diffDirect <= (long long)tol)
+        return true;
+
+    // Alternate: some globals may be dollar-based while OCR amount is cents.
+    long long valueAsCents = (long long)value * 100ll;
+    long long diffDollarGlobal = valueAsCents - (long long)amountCents;
+    if (diffDollarGlobal < 0)
+        diffDollarGlobal = -diffDollarGlobal;
+    if (diffDollarGlobal <= (long long)tol)
+        return true;
+
+    return false;
 }
 
 static void UpdateCandidateOcrMatches(MoneyCandidate& c, int currentValue, DWORD now)
@@ -771,21 +971,77 @@ static void UpdateCandidateOcrMatches(MoneyCandidate& c, int currentValue, DWORD
         c.lastOcrPotSampleId = gOcrMoney.sampleId;
         c.lastOcrMatchMs = now;
     }
+
+    bool npcMatch = false;
+    for (int npc : gOcrMoney.npcAmountsCents)
+    {
+        if (CandidateMatchesObservedOcrAmount(currentValue, npc))
+        {
+            npcMatch = true;
+            break;
+        }
+    }
+    if (npcMatch && c.lastOcrNpcSampleId != gOcrMoney.sampleId)
+    {
+        c.ocrNpcMatches++;
+        c.lastOcrNpcSampleId = gOcrMoney.sampleId;
+        c.lastOcrMatchMs = now;
+    }
 }
 
 static bool IsLikelyMoneyCandidate(const MoneyCandidate& c, DWORD now);
+
+static bool MatchesBetGridUnits(int absDelta, int minUnit, int stepUnit)
+{
+    if (absDelta <= 0 || minUnit <= 0 || stepUnit <= 0)
+        return false;
+    if (absDelta < minUnit)
+        return false;
+    return (absDelta % stepUnit) == 0;
+}
+
+static bool MatchesConfiguredBetGridDelta(int absDelta)
+{
+    int stepDollars = gCfg.moneyBetStepDollars;
+    int minDollars = gCfg.moneyBetMinDollars;
+    if (stepDollars <= 0)
+        return false;
+    if (minDollars < stepDollars)
+        minDollars = stepDollars;
+
+    bool dollarsMatch = MatchesBetGridUnits(absDelta, minDollars, stepDollars);
+    bool centsMatch = MatchesBetGridUnits(absDelta, minDollars * 100, stepDollars * 100);
+    return dollarsMatch || centsMatch;
+}
+
+static float CandidateBetStepRatio(const MoneyCandidate& c)
+{
+    int total = c.betStepMatches + c.betStepMismatches;
+    if (total <= 0)
+        return -1.0f;
+    return (float)c.betStepMatches / (float)total;
+}
 
 static float CandidateRankScore(const MoneyCandidate& c, DWORD now)
 {
     float score = 0.0f;
     score += (float)c.ocrPotMatches * 18.0f;
     score += (float)c.ocrPlayerMatches * 3.0f;
+    score += (float)c.ocrNpcMatches * 4.5f;
     score += (float)c.ocrAnyMatches * 1.2f;
     if (c.ocrPlayerMatches > c.ocrPotMatches * 2)
         score -= 6.0f;
     if (IsLikelyMoneyCandidate(c, now))
         score += 3.0f;
     score += (float)((std::min)(c.changes, 64)) * 0.08f;
+    if (gCfg.moneyBetStepFilterEnable)
+    {
+        score += (float)((std::min)(c.betStepMatches, 48)) * 0.35f;
+        score -= (float)((std::min)(c.betStepMismatches, 48)) * 0.28f;
+        float ratio = CandidateBetStepRatio(c);
+        if (ratio >= 0.0f)
+            score += (ratio - 0.5f) * 8.0f;
+    }
     if (c.lastOcrMatchMs > 0 && now > c.lastOcrMatchMs)
     {
         DWORD ageMs = now - c.lastOcrMatchMs;
@@ -838,6 +1094,13 @@ static bool IsLikelyMoneyCandidate(const MoneyCandidate& c, DWORD now)
     if (maxCps > 0.0f && CandidateChangesPerSec(c, now) > maxCps)
         return false;
 
+    if (gCfg.moneyBetStepFilterEnable)
+    {
+        int totalBetDeltas = c.betStepMatches + c.betStepMismatches;
+        if (totalBetDeltas >= 5 && c.betStepMatches * 2 < totalBetDeltas)
+            return false;
+    }
+
     return true;
 }
 
@@ -849,7 +1112,7 @@ static bool BuildSortedCandidates(DWORD now, std::vector<const MoneyCandidate*>&
     bool hasOcrCorrelated = false;
     for (auto& kv : gMoneyCands)
     {
-        bool ocrCorrelated = (kv.second.ocrAnyMatches > 0 || kv.second.ocrPotMatches > 0 || kv.second.ocrPlayerMatches > 0);
+        bool ocrCorrelated = (kv.second.ocrAnyMatches > 0 || kv.second.ocrPotMatches > 0 || kv.second.ocrPlayerMatches > 0 || kv.second.ocrNpcMatches > 0);
         if (ocrCorrelated)
             hasOcrCorrelated = true;
         if (ocrCorrelated || IsLikelyMoneyCandidate(kv.second, now))
@@ -869,6 +1132,7 @@ static bool BuildSortedCandidates(DWORD now, std::vector<const MoneyCandidate*>&
         if (sa != sb) return sa > sb;
         if (a->ocrPotMatches != b->ocrPotMatches) return a->ocrPotMatches > b->ocrPotMatches;
         if (a->ocrPlayerMatches != b->ocrPlayerMatches) return a->ocrPlayerMatches > b->ocrPlayerMatches;
+        if (a->ocrNpcMatches != b->ocrNpcMatches) return a->ocrNpcMatches > b->ocrNpcMatches;
         if (a->ocrAnyMatches != b->ocrAnyMatches) return a->ocrAnyMatches > b->ocrAnyMatches;
         if (a->changes != b->changes) return a->changes > b->changes;
         return a->idx < b->idx;
@@ -1209,6 +1473,8 @@ static DWORD gNextOcrLogAt = 0;
 static float gPendingOpacityHint = 0.5f;
 static float gLastOpacityHint = 0.5f;
 static DWORD gLastPokerAnchorSeenAt = 0;
+static DWORD gLastPayoutMarkerSeenAt = 0;
+static DWORD gPayoutHoldUntilAt = 0;
 
 static int ClampInt(int v, int lo, int hi)
 {
@@ -1715,6 +1981,67 @@ static void StopOcrProcess(bool terminate)
     gOcrProcessStartMs = 0;
 }
 
+static bool FileExistsPath(const char* path)
+{
+    if (!path || !*path)
+        return false;
+    DWORD attrs = GetFileAttributesA(path);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static std::string BuildGamePath(const char* relPath)
+{
+    if (!relPath || !*relPath)
+        return std::string();
+    std::string out = gGameDirPath;
+    if (!out.empty() && out.back() != '\\' && out.back() != '/')
+        out.push_back('\\');
+    out += relPath;
+    return out;
+}
+
+static std::string ResolveOcrExecutablePath(bool& outUsingPortable)
+{
+    outUsingPortable = false;
+
+    std::string configured = TrimAscii(gCfg.ocrTesseractPath);
+    if (configured.empty())
+        configured = "tesseract";
+
+    if (FileExistsPath(configured.c_str()))
+        return configured;
+
+    // If config points to a relative file path, resolve from game directory.
+    bool hasPathSep = configured.find('\\') != std::string::npos || configured.find('/') != std::string::npos;
+    if (hasPathSep && gGameDirPath[0] != '\0')
+    {
+        std::string rel = configured;
+        while (!rel.empty() && (rel[0] == '\\' || rel[0] == '/'))
+            rel.erase(rel.begin());
+        std::string fromGame = BuildGamePath(rel.c_str());
+        if (FileExistsPath(fromGame.c_str()))
+            return fromGame;
+    }
+
+    // Portable OCR fallback locations in game root.
+    const char* portableCandidates[] = {
+        "highstakes_ocr\\tesseract.exe",
+        "ocr\\tesseract.exe",
+        "tesseract.exe"
+    };
+    for (const char* rel : portableCandidates)
+    {
+        std::string candidate = BuildGamePath(rel);
+        if (FileExistsPath(candidate.c_str()))
+        {
+            outUsingPortable = true;
+            return candidate;
+        }
+    }
+
+    return configured;
+}
+
 static bool StartOcrProcess(DWORD now)
 {
     if (gOcrProcess)
@@ -1758,8 +2085,20 @@ static bool StartOcrProcess(DWORD now)
         return false;
     }
 
+    bool usingPortableOcr = false;
+    std::string ocrExePath = ResolveOcrExecutablePath(usingPortableOcr);
+    if (usingPortableOcr)
+    {
+        static bool warnedPortable = false;
+        if (!warnedPortable)
+        {
+            warnedPortable = true;
+            Log("[OCR] Using portable OCR runtime: '%s'", ocrExePath.c_str());
+        }
+    }
+
     std::string cmd = "cmd /C \"\"";
-    cmd += gCfg.ocrTesseractPath;
+    cmd += ocrExePath;
     cmd += "\" \"";
     cmd += gOcrBmpBottomLeftPath;
     cmd += "\" \"";
@@ -1767,7 +2106,7 @@ static bool StartOcrProcess(DWORD now)
     cmd += "\" --psm ";
     cmd += std::to_string(gCfg.ocrPsm);
     cmd += " -l eng quiet && \"";
-    cmd += gCfg.ocrTesseractPath;
+    cmd += ocrExePath;
     cmd += "\" \"";
     cmd += gOcrBmpTopRightPath;
     cmd += "\" \"";
@@ -1779,6 +2118,7 @@ static bool StartOcrProcess(DWORD now)
     STARTUPINFOA si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
+    const char* workDir = (gGameDirPath[0] != '\0') ? gGameDirPath : nullptr;
 
     std::vector<char> cmdLine(cmd.begin(), cmd.end());
     cmdLine.push_back('\0');
@@ -1791,7 +2131,7 @@ static bool StartOcrProcess(DWORD now)
         FALSE,
         CREATE_NO_WINDOW,
         nullptr,
-        nullptr,
+        workDir,
         &si,
         &pi);
 
@@ -1799,6 +2139,8 @@ static bool StartOcrProcess(DWORD now)
     {
         gLastOcrStartFailReason = OCR_START_FAIL_CREATE_PROCESS;
         gLastOcrStartWinErr = GetLastError();
+        Log("[OCR] CreateProcess failed for OCR runtime='%s' cmd='%s' err=%lu",
+            ocrExePath.c_str(), cmd.c_str(), (unsigned long)gLastOcrStartWinErr);
         CleanupOcrArtifactsIfNeeded();
         return false;
     }
@@ -2097,10 +2439,19 @@ static bool UpdatePokerStateMachine(DetectionScore& score, DWORD now)
             recentPokerAnchor &&
             score.candidateStableMs < (requiredOutStableMs + (DWORD)gCfg.ocrBlackoutMaxHoldMs);
 
+        bool payoutHoldWindowActive = gCfg.ocrPayoutGuardEnable &&
+            gDetectRuntime.phase != POKER_PHASE_OUT_OF_POKER &&
+            gPayoutHoldUntilAt > now;
+        if (payoutHoldWindowActive)
+            requiredOutStableMs += (DWORD)gCfg.ocrPayoutOutExtraMs;
+        bool payoutHoldActive = payoutHoldWindowActive &&
+            score.candidateStableMs < requiredOutStableMs;
+
         if (!score.pokerAnchor &&
             score.confidence >= gCfg.ocrPhaseConfThreshold &&
             score.candidateStableMs >= requiredOutStableMs &&
-            !fadeHoldActive)
+            !fadeHoldActive &&
+            !payoutHoldActive)
         {
             shouldTransition = true;
         }
@@ -2111,6 +2462,14 @@ static bool UpdatePokerStateMachine(DetectionScore& score, DWORD now)
                 score.reasons = "fadeHold";
             else
                 score.reasons += ",fadeHold";
+        }
+        else if (payoutHoldActive)
+        {
+            score.gateReason = "payoutHold";
+            if (score.reasons.empty())
+                score.reasons = "payoutHold";
+            else
+                score.reasons += ",payoutHold";
         }
     }
     else if (score.confidence >= gCfg.ocrPhaseConfThreshold &&
@@ -2128,6 +2487,14 @@ static bool UpdatePokerStateMachine(DetectionScore& score, DWORD now)
             PokerPhaseToString(score.guessPhase),
             score.confidence);
         gDetectRuntime.phase = score.guessPhase;
+        if (gDetectRuntime.phase == POKER_PHASE_PAYOUT_SETTLEMENT)
+        {
+            gLastPayoutMarkerSeenAt = now;
+            DWORD holdMs = (DWORD)gCfg.ocrPayoutMarkerGraceMs + (DWORD)gCfg.ocrPayoutOutExtraMs;
+            DWORD holdUntil = now + holdMs;
+            if (holdUntil > gPayoutHoldUntilAt)
+                gPayoutHoldUntilAt = holdUntil;
+        }
     }
 
     gDetectRuntime.phaseConfidence = score.confidence;
@@ -2175,12 +2542,14 @@ static bool ComputeInPokerV2(DWORD now)
             if (gOcrStartFailureStreak >= 3 && !gOcrStartFailureWarned)
             {
                 gOcrStartFailureWarned = true;
+                bool usingPortableOcr = false;
+                std::string ocrExePath = ResolveOcrExecutablePath(usingPortableOcr);
                 Log("[OCR] WARNING: Failed to start OCR process repeatedly (reason=%s, winerr=%lu, bl=(%d,%d,%d,%d), tr=(%d,%d,%d,%d), tesseract='%s').",
                     OcrStartFailReasonToString(gLastOcrStartFailReason),
                     (unsigned long)gLastOcrStartWinErr,
                     gCfg.ocrBottomLeftXPct, gCfg.ocrBottomLeftYPct, gCfg.ocrBottomLeftWPct, gCfg.ocrBottomLeftHPct,
                     gCfg.ocrTopRightXPct, gCfg.ocrTopRightYPct, gCfg.ocrTopRightWPct, gCfg.ocrTopRightHPct,
-                    gCfg.ocrTesseractPath.c_str());
+                    ocrExePath.c_str());
                 PostHudToast("OCR unavailable - check TesseractPath", HUD_TOAST_EVENT_OCR_UNAVAILABLE, now);
             }
         }
@@ -2202,6 +2571,26 @@ static bool ComputeInPokerV2(DWORD now)
         // During blackout/fade with no visible money glyphs, keep last OCR money snapshot.
         if (!(fadeLikely && !hasMoneyGlyph))
             UpdateOcrMoneySnapshot(in.rawText, now);
+
+        bool payoutMarkerNow = false;
+        if (in.rawText.find("wins") != std::string::npos ||
+            in.rawText.find("winner") != std::string::npos ||
+            in.rawText.find("collect") != std::string::npos ||
+            in.rawText.find("collected") != std::string::npos ||
+            in.rawText.find("payout") != std::string::npos)
+        {
+            payoutMarkerNow = true;
+        }
+        if (gOcrMoney.winsCents > 0)
+            payoutMarkerNow = true;
+        if (payoutMarkerNow)
+        {
+            gLastPayoutMarkerSeenAt = now;
+            DWORD holdMs = (DWORD)gCfg.ocrPayoutMarkerGraceMs + (DWORD)gCfg.ocrPayoutOutExtraMs;
+            DWORD holdUntil = now + holdMs;
+            if (holdUntil > gPayoutHoldUntilAt)
+                gPayoutHoldUntilAt = holdUntil;
+        }
     }
 
     DetectionScore score = ComputeDetectionScore(in);
@@ -2233,13 +2622,14 @@ static bool ComputeInPokerV2(DWORD now)
             gLastDetectScore.reasons.empty() ? "-" : gLastDetectScore.reasons.c_str());
         if (in.scanOk)
         {
-            Log("[OCR$] pot=%d($%.2f) src=%s main=%d($%.2f) side=%d($%.2f) wins=%d($%.2f) player=%d($%.2f) amounts=%s",
+            Log("[OCR$] pot=%d($%.2f) src=%s main=%d($%.2f) side=%d($%.2f) wins=%d($%.2f) player=%d($%.2f) npc=%s amounts=%s",
                 gOcrMoney.potCents, (double)gOcrMoney.potCents / 100.0,
                 OcrPotSourceToString(gOcrMoney.potSource),
                 gOcrMoney.mainPotCents, (double)gOcrMoney.mainPotCents / 100.0,
                 gOcrMoney.sidePotCents, (double)gOcrMoney.sidePotCents / 100.0,
                 gOcrMoney.winsCents, (double)gOcrMoney.winsCents / 100.0,
                 gOcrMoney.playerCents, (double)gOcrMoney.playerCents / 100.0,
+                OcrAmountListSnippet(gOcrMoney.npcAmountsCents).c_str(),
                 OcrAmountListSnippet(gOcrMoney.amountsCents).c_str());
         }
     }
@@ -2377,6 +2767,9 @@ static void LoadSettings()
     gCfg.ocrBlackoutAnchorGraceMs = IniGetInt("OCR", "BlackoutAnchorGraceMs", 6000, gIniPath);
     gCfg.ocrBlackoutOutExtraMs = IniGetInt("OCR", "BlackoutOutExtraMs", 2500, gIniPath);
     gCfg.ocrBlackoutMaxHoldMs = IniGetInt("OCR", "BlackoutMaxHoldMs", 2500, gIniPath);
+    gCfg.ocrPayoutGuardEnable = IniGetInt("OCR", "PayoutGuardEnable", 1, gIniPath);
+    gCfg.ocrPayoutMarkerGraceMs = IniGetInt("OCR", "PayoutMarkerGraceMs", 9000, gIniPath);
+    gCfg.ocrPayoutOutExtraMs = IniGetInt("OCR", "PayoutOutExtraMs", 5000, gIniPath);
     gCfg.ocrPlayerNameHint    = IniGetString("OCR", "PlayerNameHint", "arthur", gIniPath);
     gCfg.ocrTesseractPath      = IniGetString("OCR", "TesseractPath", "tesseract", gIniPath);
     gCfg.ocrKeywords           = IniGetString("OCR", "Keywords", "poker,ante,call,fold,raise,check,bet,pot,blind,cards,community,turn", gIniPath);
@@ -2407,6 +2800,9 @@ static void LoadSettings()
     gCfg.ocrBlackoutAnchorGraceMs = ClampInt(gCfg.ocrBlackoutAnchorGraceMs, 0, 60000);
     gCfg.ocrBlackoutOutExtraMs = ClampInt(gCfg.ocrBlackoutOutExtraMs, 0, 30000);
     gCfg.ocrBlackoutMaxHoldMs = ClampInt(gCfg.ocrBlackoutMaxHoldMs, 0, 30000);
+    gCfg.ocrPayoutGuardEnable = ClampInt(gCfg.ocrPayoutGuardEnable, 0, 1);
+    gCfg.ocrPayoutMarkerGraceMs = ClampInt(gCfg.ocrPayoutMarkerGraceMs, 0, 60000);
+    gCfg.ocrPayoutOutExtraMs = ClampInt(gCfg.ocrPayoutOutExtraMs, 0, 30000);
     gCfg.ocrPhaseConfThreshold = ClampFloat(gCfg.ocrPhaseConfThreshold, 0.20f, 0.95f);
     gCfg.ocrOpacityLow         = ClampFloat(gCfg.ocrOpacityLow, 0.0f, 255.0f);
     gCfg.ocrOpacityHigh        = ClampFloat(gCfg.ocrOpacityHigh, 0.0f, 255.0f);
@@ -2422,6 +2818,8 @@ static void LoadSettings()
     gPendingOpacityHint = 0.5f;
     gLastOpacityHint = 0.5f;
     gLastPokerAnchorSeenAt = 0;
+    gLastPayoutMarkerSeenAt = 0;
+    gPayoutHoldUntilAt = 0;
     gOcrStartFailureStreak = 0;
     gOcrStartFailureWarned = false;
     gLastOcrStartFailReason = OCR_START_FAIL_NONE;
@@ -2461,13 +2859,17 @@ static void LoadSettings()
     gCfg.moneyLogTopN           = IniGetInt("Money", "LogTopN", 5, gIniPath);
     gCfg.moneyLogOnlyOnChange   = IniGetInt("Money", "LogOnlyOnChange", 1, gIniPath);
     gCfg.moneyLikelyMaxChangesPerSec = IniGetFloat("Money", "LikelyMaxChangesPerSec", 1.5f, gIniPath);
+    gCfg.moneyNpcTrackMax       = IniGetInt("Money", "NpcTrackMax", 5, gIniPath);
+    gCfg.moneyBetStepFilterEnable = IniGetInt("Money", "BetStepFilterEnable", 1, gIniPath);
+    gCfg.moneyBetStepDollars    = IniGetInt("Money", "BetStepDollars", 5, gIniPath);
+    gCfg.moneyBetMinDollars     = IniGetInt("Money", "BetMinDollars", 10, gIniPath);
     gCfg.moneyExceptionLogCooldownMs = IniGetInt("Money", "ExceptionLogCooldownMs", 30000, gIniPath);
     gCfg.moneySkipFaultRuns     = IniGetInt("Money", "SkipFaultRuns", 1, gIniPath);
     gCfg.moneyOcrMatchToleranceCents = IniGetInt("Money", "OcrMatchToleranceCents", 6, gIniPath);
     gCfg.moneyAutoLockPot       = IniGetInt("Money", "AutoLockPot", 1, gIniPath);
-    gCfg.moneyAutoLockPotMinMatches = IniGetInt("Money", "AutoLockPotMinMatches", 6, gIniPath);
+    gCfg.moneyAutoLockPotMinMatches = IniGetInt("Money", "AutoLockPotMinMatches", 10, gIniPath);
     gCfg.moneyAutoLockPlayer    = IniGetInt("Money", "AutoLockPlayer", 1, gIniPath);
-    gCfg.moneyAutoLockPlayerMinMatches = IniGetInt("Money", "AutoLockPlayerMinMatches", 6, gIniPath);
+    gCfg.moneyAutoLockPlayerMinMatches = IniGetInt("Money", "AutoLockPlayerMinMatches", 8, gIniPath);
     gCfg.moneyOverlayMultiplier = IniGetFloat("Money", "OverlayMultiplier", 2.0f, gIniPath);
     gCfg.moneyPayoutEnable      = IniGetInt("Money", "PayoutEnable", 0, gIniPath);
     gCfg.moneyPayoutMultiplier  = IniGetFloat("Money", "PayoutMultiplier", 2.0f, gIniPath);
@@ -2492,6 +2894,10 @@ static void LoadSettings()
     moneyCfgClamped |= ClampIntSetting("ScanMaxReadsPerStep", gCfg.moneyScanMaxReadsPerStep, 1, 1000000);
     moneyCfgClamped |= ClampIntSetting("ScanMaxStepMs", gCfg.moneyScanMaxStepMs, 1, 1000);
     moneyCfgClamped |= ClampIntSetting("LogOnlyOnChange", gCfg.moneyLogOnlyOnChange, 0, 1);
+    moneyCfgClamped |= ClampIntSetting("NpcTrackMax", gCfg.moneyNpcTrackMax, 0, 32);
+    moneyCfgClamped |= ClampIntSetting("BetStepFilterEnable", gCfg.moneyBetStepFilterEnable, 0, 1);
+    moneyCfgClamped |= ClampIntSetting("BetStepDollars", gCfg.moneyBetStepDollars, 1, 1000);
+    moneyCfgClamped |= ClampIntSetting("BetMinDollars", gCfg.moneyBetMinDollars, 1, 100000);
     moneyCfgClamped |= ClampIntSetting("ExceptionLogCooldownMs", gCfg.moneyExceptionLogCooldownMs, 0, 600000);
     moneyCfgClamped |= ClampIntSetting("SkipFaultRuns", gCfg.moneySkipFaultRuns, 0, 1);
     moneyCfgClamped |= ClampIntSetting("LogTopN", gCfg.moneyLogTopN, 0, 64);
@@ -2529,6 +2935,15 @@ static void LoadSettings()
         gCfg.moneyOverlayMultiplier = 1000.0f;
         moneyCfgClamped = true;
         Log("[CFG] WARNING: Money.OverlayMultiplier too large. Clamped to 1000.");
+    }
+
+    if (gCfg.moneyBetMinDollars < gCfg.moneyBetStepDollars)
+    {
+        int oldMin = gCfg.moneyBetMinDollars;
+        gCfg.moneyBetMinDollars = gCfg.moneyBetStepDollars;
+        moneyCfgClamped = true;
+        Log("[CFG] WARNING: Money.BetMinDollars (%d) < BetStepDollars (%d). Clamped to %d.",
+            oldMin, gCfg.moneyBetStepDollars, gCfg.moneyBetMinDollars);
     }
 
     if (gCfg.moneyPayoutMultiplier < 1.0f)
@@ -2570,7 +2985,7 @@ static void LoadSettings()
     Log("[CFG] PokerRadius=%.2f MsgMs=%d CooldownMs=%d CheckIntervalMs=%d DebugOverlay=%d",
         gCfg.pokerRadius, gCfg.msgDurationMs, gCfg.enterCooldownMs, gCfg.checkIntervalMs,
         gCfg.debugOverlay);
-    Log("[CFG] OCR: Enabled=%d IntervalMs=%d ProcTimeoutMs=%d BL=(%d,%d,%d,%d) TR=(%d,%d,%d,%d) PSM=%d DebugReason=%d LogEveryMs=%d DumpArtifacts=%d PhaseStableMs=%d OutStableMs=%d PhaseConf=%.2f OpacityHint=%d OpacityROI=(%d,%d,%d,%d) OpacityRange=[%.1f..%.1f] BlackoutGuard=%d BlackoutOpacity<=%.2f BlackoutGraceMs=%d BlackoutOutExtraMs=%d BlackoutMaxHoldMs=%d PlayerNameHint='%s' Tesseract='%s' Keywords=%d",
+    Log("[CFG] OCR: Enabled=%d IntervalMs=%d ProcTimeoutMs=%d BL=(%d,%d,%d,%d) TR=(%d,%d,%d,%d) PSM=%d DebugReason=%d LogEveryMs=%d DumpArtifacts=%d PhaseStableMs=%d OutStableMs=%d PhaseConf=%.2f OpacityHint=%d OpacityROI=(%d,%d,%d,%d) OpacityRange=[%.1f..%.1f] BlackoutGuard=%d BlackoutOpacity<=%.2f BlackoutGraceMs=%d BlackoutOutExtraMs=%d BlackoutMaxHoldMs=%d PayoutGuard=%d PayoutGraceMs=%d PayoutOutExtraMs=%d PlayerNameHint='%s' Tesseract='%s' Keywords=%d",
         gCfg.ocrEnabled, gCfg.ocrIntervalMs,
         gCfg.ocrProcessTimeoutMs,
         gCfg.ocrBottomLeftXPct, gCfg.ocrBottomLeftYPct, gCfg.ocrBottomLeftWPct, gCfg.ocrBottomLeftHPct,
@@ -2581,8 +2996,15 @@ static void LoadSettings()
         gCfg.ocrOpacityRoiXPct, gCfg.ocrOpacityRoiYPct, gCfg.ocrOpacityRoiWPct, gCfg.ocrOpacityRoiHPct,
         gCfg.ocrOpacityLow, gCfg.ocrOpacityHigh,
         gCfg.ocrBlackoutGuardEnable, gCfg.ocrBlackoutOpacityThreshold, gCfg.ocrBlackoutAnchorGraceMs, gCfg.ocrBlackoutOutExtraMs, gCfg.ocrBlackoutMaxHoldMs,
+        gCfg.ocrPayoutGuardEnable, gCfg.ocrPayoutMarkerGraceMs, gCfg.ocrPayoutOutExtraMs,
         gCfg.ocrPlayerNameHint.c_str(),
         gCfg.ocrTesseractPath.c_str(), (int)gOcrKeywords.size());
+    {
+        bool usingPortableOcr = false;
+        std::string ocrExePath = ResolveOcrExecutablePath(usingPortableOcr);
+        Log("[CFG] OCR runtime: resolved='%s' portable=%d gameDir='%s'",
+            ocrExePath.c_str(), usingPortableOcr ? 1 : 0, gGameDirPath);
+    }
     Log("[CFG] HUD: DrawMethod=%d HUDUiMode=%d ToastEnabled=%d ToastFallbackText=%d ToastIconDict='%s' ToastIcon='%s' ToastColor='%s' ToastDurationMs=%d ToastRetryMs=%d Panel=(%d,%d) LineStep=%.2f MaxLines=%d AnchorBottom=%d ToastSoundSet='%s' ToastSound='%s'",
         gDrawMethod, gCfg.hudUiMode, gCfg.hudToastEnabled, gCfg.hudToastFallbackText,
         gCfg.hudToastIconDict.c_str(), gCfg.hudToastIcon.c_str(), gCfg.hudToastColor.c_str(),
@@ -2595,11 +3017,12 @@ static void LoadSettings()
         gCfg.moneyScanBatch, gCfg.moneyScanIntervalMs,
         gCfg.moneyValueMin, gCfg.moneyValueMax,
         gCfg.moneyTopN, gCfg.moneyPruneMs);
-    Log("[CFG] Money perf: ScanMaxReadsPerStep=%d ScanMaxStepMs=%d ExceptionLogCooldownMs=%d SkipFaultRuns=%d LikelyMaxChangesPerSec=%.2f",
+    Log("[CFG] Money perf: ScanMaxReadsPerStep=%d ScanMaxStepMs=%d ExceptionLogCooldownMs=%d SkipFaultRuns=%d LikelyMaxChangesPerSec=%.2f BetStepFilter=%d BetStepDollars=%d BetMinDollars=%d",
         gCfg.moneyScanMaxReadsPerStep, gCfg.moneyScanMaxStepMs,
-        gCfg.moneyExceptionLogCooldownMs, gCfg.moneySkipFaultRuns, gCfg.moneyLikelyMaxChangesPerSec);
-    Log("[CFG] Money OCR: OcrMatchToleranceCents=%d AutoLockPot=%d AutoLockPotMinMatches=%d AutoLockPlayer=%d AutoLockPlayerMinMatches=%d OverlayMultiplier=%.2f",
-        gCfg.moneyOcrMatchToleranceCents, gCfg.moneyAutoLockPot, gCfg.moneyAutoLockPotMinMatches,
+        gCfg.moneyExceptionLogCooldownMs, gCfg.moneySkipFaultRuns, gCfg.moneyLikelyMaxChangesPerSec,
+        gCfg.moneyBetStepFilterEnable, gCfg.moneyBetStepDollars, gCfg.moneyBetMinDollars);
+    Log("[CFG] Money OCR: OcrMatchToleranceCents=%d NpcTrackMax=%d AutoLockPot=%d AutoLockPotMinMatches=%d AutoLockPlayer=%d AutoLockPlayerMinMatches=%d OverlayMultiplier=%.2f",
+        gCfg.moneyOcrMatchToleranceCents, gCfg.moneyNpcTrackMax, gCfg.moneyAutoLockPot, gCfg.moneyAutoLockPotMinMatches,
         gCfg.moneyAutoLockPlayer, gCfg.moneyAutoLockPlayerMinMatches, gCfg.moneyOverlayMultiplier);
     Log("[CFG] Money payout: Enable=%d Multiplier=%.2f UseWinsAmount=%d FallbackToPot=%d CooldownMs=%d MinPhaseConf=%.2f",
         gCfg.moneyPayoutEnable, gCfg.moneyPayoutMultiplier, gCfg.moneyPayoutUseWinsAmount,
@@ -2669,6 +3092,27 @@ static bool TryReadEffectivePlayerCents(int& outPlayerCents)
     return true;
 }
 
+static bool CandidatePassesPotAutoLockChecks(const MoneyCandidate& c, DWORD now)
+{
+    if (c.ocrPotMatches < gCfg.moneyAutoLockPotMinMatches)
+        return false;
+    if (c.changes < 2)
+        return false;
+    if (!IsLikelyMoneyCandidate(c, now))
+        return false;
+    if (c.ocrPlayerMatches * 2 > c.ocrPotMatches)
+        return false;
+    if (c.ocrAnyMatches > 0 && c.ocrPotMatches * 2 < c.ocrAnyMatches)
+        return false;
+    if (gCfg.moneyBetStepFilterEnable)
+    {
+        int totalBet = c.betStepMatches + c.betStepMismatches;
+        if (totalBet >= 4 && c.betStepMatches * 2 < totalBet)
+            return false;
+    }
+    return true;
+}
+
 static bool TryAutoLockPotGlobal(const std::vector<const MoneyCandidate*>& sorted, DWORD now)
 {
     if (!gCfg.moneyAutoLockPot)
@@ -2684,9 +3128,10 @@ static bool TryAutoLockPotGlobal(const std::vector<const MoneyCandidate*>& sorte
     {
         if (!c)
             continue;
-        if (c->ocrPotMatches < gCfg.moneyAutoLockPotMinMatches)
+        if (!CandidatePassesPotAutoLockChecks(*c, now))
             continue;
-        if (c->ocrPlayerMatches > c->ocrPotMatches)
+        if (gOcrMoney.potCents > 0 && gOcrMoney.potSource != 5 &&
+            !CandidateMatchesObservedOcrAmount(c->last, gOcrMoney.potCents))
             continue;
         if (c->lastOcrMatchMs == 0)
             continue;
@@ -2733,6 +3178,7 @@ static bool TryAutoLockPlayerGlobal(DWORD now)
 
         float score = (float)c.ocrPlayerMatches * 12.0f
             - (float)c.ocrPotMatches * 7.0f
+            - (float)c.ocrNpcMatches * 2.5f
             + (float)c.ocrAnyMatches * 0.5f;
         if (score > bestScore)
         {
@@ -2760,6 +3206,24 @@ static bool TryAutoLockPlayerGlobal(DWORD now)
     return true;
 }
 
+static bool IsLikelyValidPayoutAmount(int cents)
+{
+    if (cents <= 0)
+        return false;
+    if (cents > gCfg.moneyValueMax * 4)
+        return false;
+
+    // If OCR has a non-fallback pot, reject payout amounts wildly off that anchor.
+    if (gOcrMoney.potCents > 0 && gOcrMoney.potSource != 5)
+    {
+        if (cents > gOcrMoney.potCents * 2)
+            return false;
+        if (cents * 3 < gOcrMoney.potCents)
+            return false;
+    }
+    return true;
+}
+
 static bool TryGetPayoutSourceCents(DWORD now, int& outSourceCents, const char*& outSourceLabel)
 {
     outSourceCents = 0;
@@ -2767,7 +3231,8 @@ static bool TryGetPayoutSourceCents(DWORD now, int& outSourceCents, const char*&
 
     bool ocrFresh = IsOcrMoneyFresh(now);
 
-    if (gCfg.moneyPayoutUseWinsAmount && ocrFresh && gOcrMoney.winsCents > 0)
+    if (gCfg.moneyPayoutUseWinsAmount && ocrFresh && gOcrMoney.winsCents > 0 &&
+        IsLikelyValidPayoutAmount(gOcrMoney.winsCents))
     {
         outSourceCents = gOcrMoney.winsCents;
         outSourceLabel = "wins";
@@ -2879,7 +3344,14 @@ static void RescanExistingCandidates(DWORD now)
         // Detect change
         if (val != kv.second.last)
         {
+            int delta = val - kv.second.last;
+            int absDelta = (delta < 0) ? -delta : delta;
             kv.second.changes++;
+            kv.second.lastDelta = delta;
+            if (MatchesConfiguredBetGridDelta(absDelta))
+                kv.second.betStepMatches++;
+            else
+                kv.second.betStepMismatches++;
             kv.second.last = val;
             kv.second.lastChangeMs = now;
             kv.second.lastSeenMs = now;
@@ -3075,9 +3547,12 @@ static void MoneyTick(bool inPoker, DWORD now)
             for (int i = 0; i < logN; i++)
             {
                 float cps = CandidateChangesPerSec(*sorted[i], now);
-                Log("[MONEY] Cand idx=%d val=%d (~%.2f if cents) changes=%d rate=%.2f/s ocrAny=%d ocrPot=%d ocrPlayer=%d",
+                float stepRatio = CandidateBetStepRatio(*sorted[i]);
+                Log("[MONEY] Cand idx=%d val=%d (~%.2f if cents) changes=%d rate=%.2f/s step=%d/%d ratio=%.2f lastDelta=%+d ocrAny=%d ocrPot=%d ocrPlayer=%d ocrNpc=%d",
                     sorted[i]->idx, sorted[i]->last, (double)sorted[i]->last / 100.0,
-                    sorted[i]->changes, cps, sorted[i]->ocrAnyMatches, sorted[i]->ocrPotMatches, sorted[i]->ocrPlayerMatches);
+                    sorted[i]->changes, cps, sorted[i]->betStepMatches, sorted[i]->betStepMismatches,
+                    stepRatio, sorted[i]->lastDelta,
+                    sorted[i]->ocrAnyMatches, sorted[i]->ocrPotMatches, sorted[i]->ocrPlayerMatches, sorted[i]->ocrNpcMatches);
             }
         }
     }
@@ -3160,6 +3635,12 @@ static void MoneyTick(bool inPoker, DWORD now)
         if (!DrawPanelLine(panel, buf))
             return;
     }
+    if (!gOcrMoney.npcAmountsCents.empty())
+    {
+        _snprintf_s(buf, sizeof(buf), "OCR NPC$ = %s", OcrAmountListSnippet(gOcrMoney.npcAmountsCents, 6).c_str());
+        if (!DrawPanelLine(panel, buf))
+            return;
+    }
     if (!gOcrMoney.amountsCents.empty())
     {
         _snprintf_s(buf, sizeof(buf), "OCR $ = %s", OcrAmountListSnippet(gOcrMoney.amountsCents, 5).c_str());
@@ -3226,6 +3707,12 @@ static void MoneyTick(bool inPoker, DWORD now)
     if (!DrawPanelLine(panel, buf))
         return;
 
+    _snprintf_s(buf, sizeof(buf), "BetRule=%s min=$%d step=$%d",
+        gCfg.moneyBetStepFilterEnable ? "on" : "off",
+        gCfg.moneyBetMinDollars, gCfg.moneyBetStepDollars);
+    if (!DrawPanelLine(panel, buf))
+        return;
+
     if (gCfg.hudUiMode != HUD_UI_MODE_LEGACY_TEXT)
     {
         int retryInMs = 0;
@@ -3245,9 +3732,15 @@ static void MoneyTick(bool inPoker, DWORD now)
     BuildSortedCandidates(now, sorted);
 
     bool hasOcrAmounts = !gOcrMoney.amountsCents.empty();
-    int maxPerGroup = (std::max)(1, gCfg.moneyTopN / 2);
+    int groupCount = 0;
+    if (gOcrMoney.potCents > 0) groupCount++;
+    if (gOcrMoney.playerCents > 0) groupCount++;
+    if (!gOcrMoney.npcAmountsCents.empty()) groupCount++;
+    if (groupCount <= 0) groupCount = 1;
+    int maxPerGroup = (std::max)(1, gCfg.moneyTopN / groupCount);
     int shownPot = 0;
     int shownPlayer = 0;
+    int shownNpc = 0;
 
     if (gOcrMoney.potCents > 0)
     {
@@ -3256,8 +3749,9 @@ static void MoneyTick(bool inPoker, DWORD now)
             const MoneyCandidate* c = sorted[i];
             if (c->ocrPotMatches <= 0)
                 continue;
-            _snprintf_s(buf, sizeof(buf), "P%02d idx=%d v=%d($%.2f) pot=%d player=%d",
-                shownPot + 1, c->idx, c->last, (double)c->last / 100.0, c->ocrPotMatches, c->ocrPlayerMatches);
+            _snprintf_s(buf, sizeof(buf), "P%02d idx=%d v=%d($%.2f) pot=%d player=%d d=%+d step=%d/%d",
+                shownPot + 1, c->idx, c->last, (double)c->last / 100.0, c->ocrPotMatches, c->ocrPlayerMatches,
+                c->lastDelta, c->betStepMatches, c->betStepMismatches);
             if (!DrawPanelLine(panel, buf))
                 break;
             shownPot++;
@@ -3273,8 +3767,9 @@ static void MoneyTick(bool inPoker, DWORD now)
             const MoneyCandidate* c = sorted[i];
             if (c->ocrPlayerMatches <= 0)
                 continue;
-            _snprintf_s(buf, sizeof(buf), "U%02d idx=%d v=%d($%.2f) player=%d pot=%d",
-                shownPlayer + 1, c->idx, c->last, (double)c->last / 100.0, c->ocrPlayerMatches, c->ocrPotMatches);
+            _snprintf_s(buf, sizeof(buf), "U%02d idx=%d v=%d($%.2f) player=%d pot=%d d=%+d step=%d/%d",
+                shownPlayer + 1, c->idx, c->last, (double)c->last / 100.0, c->ocrPlayerMatches, c->ocrPotMatches,
+                c->lastDelta, c->betStepMatches, c->betStepMismatches);
             if (!DrawPanelLine(panel, buf))
                 break;
             shownPlayer++;
@@ -3283,8 +3778,29 @@ static void MoneyTick(bool inPoker, DWORD now)
         }
     }
 
-    if (shownPot == 0 && shownPlayer == 0 && hasOcrAmounts)
-        DrawPanelLine(panel, "Diag globals: no OCR-pot/player matches yet");
+    if (!gOcrMoney.npcAmountsCents.empty())
+    {
+        for (int i = 0; i < (int)sorted.size(); i++)
+        {
+            const MoneyCandidate* c = sorted[i];
+            if (c->ocrNpcMatches <= 0)
+                continue;
+            if (c->ocrPotMatches > c->ocrNpcMatches * 2)
+                continue;
+            if (c->ocrPlayerMatches > c->ocrNpcMatches * 2)
+                continue;
+            _snprintf_s(buf, sizeof(buf), "N%02d idx=%d v=%d($%.2f) npc=%d pot=%d player=%d",
+                shownNpc + 1, c->idx, c->last, (double)c->last / 100.0, c->ocrNpcMatches, c->ocrPotMatches, c->ocrPlayerMatches);
+            if (!DrawPanelLine(panel, buf))
+                break;
+            shownNpc++;
+            if (shownNpc >= maxPerGroup)
+                break;
+        }
+    }
+
+    if (shownPot == 0 && shownPlayer == 0 && shownNpc == 0 && hasOcrAmounts)
+        DrawPanelLine(panel, "Diag globals: no OCR pot/player/npc matches yet");
 }
 
 static void InitPaths()
@@ -3294,8 +3810,11 @@ static void InitPaths()
     char* lastSlash = strrchr(gIniPath, '\\');
     if (lastSlash) *(lastSlash + 1) = '\0';
 
-    strcpy_s(gLogPath, MAX_PATH, gIniPath);
+    strcpy_s(gGameDirPath, MAX_PATH, gIniPath);
+
+    strcpy_s(gLogPath, MAX_PATH, gGameDirPath);
     strcat_s(gLogPath, MAX_PATH, "highstakes.log");
+    strcpy_s(gIniPath, MAX_PATH, gGameDirPath);
     strcat_s(gIniPath, MAX_PATH, "highstakes.ini");
 
     char tempPath[MAX_PATH]{ 0 };
@@ -3319,19 +3838,19 @@ static void InitPaths()
     }
     else
     {
-        strcpy_s(gOcrBmpBottomLeftPath, MAX_PATH, gIniPath);
+        strcpy_s(gOcrBmpBottomLeftPath, MAX_PATH, gGameDirPath);
         strcat_s(gOcrBmpBottomLeftPath, MAX_PATH, "highstakes_ocr_bl.bmp");
-        strcpy_s(gOcrBmpTopRightPath, MAX_PATH, gIniPath);
+        strcpy_s(gOcrBmpTopRightPath, MAX_PATH, gGameDirPath);
         strcat_s(gOcrBmpTopRightPath, MAX_PATH, "highstakes_ocr_tr.bmp");
 
-        strcpy_s(gOcrOutBaseBottomLeftPath, MAX_PATH, gIniPath);
+        strcpy_s(gOcrOutBaseBottomLeftPath, MAX_PATH, gGameDirPath);
         strcat_s(gOcrOutBaseBottomLeftPath, MAX_PATH, "highstakes_ocr_bl");
-        strcpy_s(gOcrOutBaseTopRightPath, MAX_PATH, gIniPath);
+        strcpy_s(gOcrOutBaseTopRightPath, MAX_PATH, gGameDirPath);
         strcat_s(gOcrOutBaseTopRightPath, MAX_PATH, "highstakes_ocr_tr");
 
-        strcpy_s(gOcrTxtBottomLeftPath, MAX_PATH, gIniPath);
+        strcpy_s(gOcrTxtBottomLeftPath, MAX_PATH, gGameDirPath);
         strcat_s(gOcrTxtBottomLeftPath, MAX_PATH, "highstakes_ocr_bl.txt");
-        strcpy_s(gOcrTxtTopRightPath, MAX_PATH, gIniPath);
+        strcpy_s(gOcrTxtTopRightPath, MAX_PATH, gGameDirPath);
         strcat_s(gOcrTxtTopRightPath, MAX_PATH, "highstakes_ocr_tr.txt");
     }
 }
@@ -3424,12 +3943,14 @@ static void Tick()
         DrawPanelLine(debugPanel, dbg);
 
         _snprintf_s(dbg, sizeof(dbg),
-            "scan=%d pending=%d hits=%d anchors=%d opacity=%.2f",
+            "scan=%d pending=%d hits=%d anchors=%d opacity=%.2f payoutAgeMs=%ld payoutHoldMs=%ld",
             gLastDetectInputs.scanOk ? 1 : 0,
             gLastDetectInputs.pending ? 1 : 0,
             gLastDetectInputs.keywordHits,
             gLastDetectInputs.anchorHits,
-            gLastDetectScore.opacityHint);
+            gLastDetectScore.opacityHint,
+            (long)((gLastPayoutMarkerSeenAt > 0 && now >= gLastPayoutMarkerSeenAt) ? (now - gLastPayoutMarkerSeenAt) : -1L),
+            (long)((gPayoutHoldUntilAt > now) ? (gPayoutHoldUntilAt - now) : 0L));
         DrawPanelLine(debugPanel, dbg);
     }
 
