@@ -118,14 +118,15 @@ struct Settings
     int ocrEnterStableMs = 600;
     int ocrExitStableMs = 1800;
     int ocrProcessTimeoutMs = 2000;
-    int ocrRegionXPct = 30;
-    int ocrRegionYPct = 68;
-    int ocrRegionWPct = 40;
-    int ocrRegionHPct = 24;
-    int ocrPsm = 6;
+    int ocrRegionXPct = 0;
+    int ocrRegionYPct = 58;
+    int ocrRegionWPct = 100;
+    int ocrRegionHPct = 42;
+    int ocrPsm = 11;
     int ocrDebugReasonOverlay = 0;
+    int ocrLogEveryMs = 0;             // 0=disabled; otherwise logs OCR scan summaries
     std::string ocrTesseractPath = "tesseract";
-    std::string ocrKeywords = "poker,ante,call,fold,raise,check,pot";
+    std::string ocrKeywords = "poker,ante,call,fold,raise,check,bet,pot";
 
     // -------- Money sniffing (visual confirmation) --------
     int moneyOverlay = 1;               // 1=show money overlay while in poker
@@ -414,6 +415,15 @@ static std::string gLegacyHudMessage = "~COLOR_GOLD~Mod Online";
 static DWORD gLegacyHudMessageUntil = 0;
 static int gOcrStartFailureStreak = 0;
 static bool gOcrStartFailureWarned = false;
+enum OcrStartFailReason
+{
+    OCR_START_FAIL_NONE = 0,
+    OCR_START_FAIL_NO_FOREGROUND = 1,
+    OCR_START_FAIL_CAPTURE = 2,
+    OCR_START_FAIL_CREATE_PROCESS = 3
+};
+static OcrStartFailReason gLastOcrStartFailReason = OCR_START_FAIL_NONE;
+static DWORD gLastOcrStartWinErr = 0;
 static Hash gHudToastIconHash = 0;
 static Hash gHudToastColorHash = 0;
 
@@ -541,6 +551,7 @@ static char gOcrTxtPath[MAX_PATH]{ 0 };
 static HANDLE gOcrProcess = nullptr;
 static DWORD gOcrProcessStartMs = 0;
 static DWORD gNextOcrStartAt = 0;
+static DWORD gNextOcrLogAt = 0;
 
 static int ClampInt(int v, int lo, int hi)
 {
@@ -570,6 +581,53 @@ static std::string ToLowerAscii(std::string s)
             c = (char)(c - 'A' + 'a');
     }
     return s;
+}
+
+static const char* OcrStartFailReasonToString(OcrStartFailReason reason)
+{
+    switch (reason)
+    {
+    case OCR_START_FAIL_NO_FOREGROUND:
+        return "noForeground";
+    case OCR_START_FAIL_CAPTURE:
+        return "capture";
+    case OCR_START_FAIL_CREATE_PROCESS:
+        return "createProcess";
+    default:
+        return "none";
+    }
+}
+
+static std::string OcrTextLogSnippet(const std::string& text, size_t maxChars)
+{
+    std::string out;
+    out.reserve((std::min)(maxChars, text.size()));
+
+    bool prevSpace = false;
+    for (char c : text)
+    {
+        unsigned char uc = (unsigned char)c;
+        bool isWhitespace = (uc <= ' ');
+        if (isWhitespace)
+        {
+            if (!out.empty() && !prevSpace)
+            {
+                out.push_back(' ');
+                prevSpace = true;
+            }
+            continue;
+        }
+
+        if (uc < 32 || uc > 126)
+            c = '?';
+
+        out.push_back(c);
+        prevSpace = false;
+        if (out.size() >= maxChars)
+            break;
+    }
+
+    return TrimAscii(out);
 }
 
 static void BuildOcrKeywordList()
@@ -744,13 +802,23 @@ static bool StartOcrProcess(DWORD now)
     if (gOcrProcess)
         return false;
 
+    gLastOcrStartFailReason = OCR_START_FAIL_NONE;
+    gLastOcrStartWinErr = 0;
+
     HWND hwnd = nullptr;
     if (!GetGameForegroundWindow(hwnd))
+    {
+        gLastOcrStartFailReason = OCR_START_FAIL_NO_FOREGROUND;
         return false;
+    }
 
     DeleteFileA(gOcrTxtPath);
     if (!CaptureOcrRegionToBmp(hwnd))
+    {
+        gLastOcrStartFailReason = OCR_START_FAIL_CAPTURE;
+        gLastOcrStartWinErr = GetLastError();
         return false;
+    }
 
     std::string cmd = "\"";
     cmd += gCfg.ocrTesseractPath;
@@ -782,7 +850,11 @@ static bool StartOcrProcess(DWORD now)
         &pi);
 
     if (!ok)
+    {
+        gLastOcrStartFailReason = OCR_START_FAIL_CREATE_PROCESS;
+        gLastOcrStartWinErr = GetLastError();
         return false;
+    }
 
     CloseHandle(pi.hThread);
     gOcrProcess = pi.hProcess;
@@ -945,7 +1017,11 @@ static bool ComputeInPokerV2(DWORD now)
             if (gOcrStartFailureStreak >= 3 && !gOcrStartFailureWarned)
             {
                 gOcrStartFailureWarned = true;
-                Log("[OCR] WARNING: Failed to start OCR process repeatedly. Check OCR.TesseractPath.");
+                Log("[OCR] WARNING: Failed to start OCR process repeatedly (reason=%s, winerr=%lu, region=(%d,%d,%d,%d), tesseract='%s').",
+                    OcrStartFailReasonToString(gLastOcrStartFailReason),
+                    (unsigned long)gLastOcrStartWinErr,
+                    gCfg.ocrRegionXPct, gCfg.ocrRegionYPct, gCfg.ocrRegionWPct, gCfg.ocrRegionHPct,
+                    gCfg.ocrTesseractPath.c_str());
                 PostHudToast("OCR unavailable - check TesseractPath", HUD_TOAST_EVENT_OCR_UNAVAILABLE, now);
             }
         }
@@ -961,6 +1037,19 @@ static bool ComputeInPokerV2(DWORD now)
     DetectionScore score = ComputeDetectionScore(in);
     gLastDetectInputs = in;
     gLastDetectScore = score;
+
+    if (gCfg.ocrLogEveryMs > 0 && now >= gNextOcrLogAt)
+    {
+        gNextOcrLogAt = now + (DWORD)gCfg.ocrLogEveryMs;
+        std::string snippet = in.scanOk ? OcrTextLogSnippet(gLastOcrText, 96) : "";
+        Log("[OCR] scanOk=%d pending=%d hits=%d score=%d gate=%s text='%s'",
+            in.scanOk ? 1 : 0,
+            in.pending ? 1 : 0,
+            in.keywordHits,
+            score.total,
+            score.gateReason,
+            snippet.c_str());
+    }
 
     return UpdatePokerStateMachine(score, now);
 }
@@ -1045,14 +1134,15 @@ static void LoadSettings()
     gCfg.ocrEnterStableMs      = IniGetInt("OCR", "EnterStableMs", 600, gIniPath);
     gCfg.ocrExitStableMs       = IniGetInt("OCR", "ExitStableMs", 1800, gIniPath);
     gCfg.ocrProcessTimeoutMs   = IniGetInt("OCR", "ProcessTimeoutMs", 2000, gIniPath);
-    gCfg.ocrRegionXPct         = IniGetInt("OCR", "RegionXPct", 30, gIniPath);
-    gCfg.ocrRegionYPct         = IniGetInt("OCR", "RegionYPct", 68, gIniPath);
-    gCfg.ocrRegionWPct         = IniGetInt("OCR", "RegionWPct", 40, gIniPath);
-    gCfg.ocrRegionHPct         = IniGetInt("OCR", "RegionHPct", 24, gIniPath);
-    gCfg.ocrPsm                = IniGetInt("OCR", "PSM", 6, gIniPath);
+    gCfg.ocrRegionXPct         = IniGetInt("OCR", "RegionXPct", 0, gIniPath);
+    gCfg.ocrRegionYPct         = IniGetInt("OCR", "RegionYPct", 58, gIniPath);
+    gCfg.ocrRegionWPct         = IniGetInt("OCR", "RegionWPct", 100, gIniPath);
+    gCfg.ocrRegionHPct         = IniGetInt("OCR", "RegionHPct", 42, gIniPath);
+    gCfg.ocrPsm                = IniGetInt("OCR", "PSM", 11, gIniPath);
     gCfg.ocrDebugReasonOverlay = IniGetInt("OCR", "DebugReasonOverlay", 0, gIniPath);
+    gCfg.ocrLogEveryMs         = IniGetInt("OCR", "LogEveryMs", 0, gIniPath);
     gCfg.ocrTesseractPath      = IniGetString("OCR", "TesseractPath", "tesseract", gIniPath);
-    gCfg.ocrKeywords           = IniGetString("OCR", "Keywords", "poker,ante,call,fold,raise,check,pot", gIniPath);
+    gCfg.ocrKeywords           = IniGetString("OCR", "Keywords", "poker,ante,call,fold,raise,check,bet,pot", gIniPath);
 
     gCfg.ocrEnabled            = ClampInt(gCfg.ocrEnabled, 0, 1);
     gCfg.ocrIntervalMs         = ClampInt(gCfg.ocrIntervalMs, 200, 30000);
@@ -1067,12 +1157,16 @@ static void LoadSettings()
     gCfg.ocrRegionHPct         = ClampInt(gCfg.ocrRegionHPct, 1, 100);
     gCfg.ocrPsm                = ClampInt(gCfg.ocrPsm, 3, 13);
     gCfg.ocrDebugReasonOverlay = ClampInt(gCfg.ocrDebugReasonOverlay, 0, 1);
+    gCfg.ocrLogEveryMs         = ClampInt(gCfg.ocrLogEveryMs, 0, 60000);
 
     BuildOcrKeywordList();
     StopOcrProcess(true);
     gNextOcrStartAt = 0;
+    gNextOcrLogAt = 0;
     gOcrStartFailureStreak = 0;
     gOcrStartFailureWarned = false;
+    gLastOcrStartFailReason = OCR_START_FAIL_NONE;
+    gLastOcrStartWinErr = 0;
     gHudToastNativeFailed = false;
     gHudToastNativeWarned = false;
     gLegacyHudMessage = "~COLOR_GOLD~Mod Online";
@@ -1157,13 +1251,13 @@ static void LoadSettings()
     Log("[CFG] PokerRadius=%.2f MsgMs=%d CooldownMs=%d CheckIntervalMs=%d DebugOverlay=%d",
         gCfg.pokerRadius, gCfg.msgDurationMs, gCfg.enterCooldownMs, gCfg.checkIntervalMs,
         gCfg.debugOverlay);
-    Log("[CFG] OCR: Enabled=%d IntervalMs=%d EnterHits=%d ExitHits=%d EnterStableMs=%d ExitStableMs=%d ProcTimeoutMs=%d Region=(%d,%d,%d,%d) PSM=%d DebugReason=%d Tesseract='%s' Keywords=%d",
+    Log("[CFG] OCR: Enabled=%d IntervalMs=%d EnterHits=%d ExitHits=%d EnterStableMs=%d ExitStableMs=%d ProcTimeoutMs=%d Region=(%d,%d,%d,%d) PSM=%d DebugReason=%d LogEveryMs=%d Tesseract='%s' Keywords=%d",
         gCfg.ocrEnabled, gCfg.ocrIntervalMs,
         gCfg.ocrEnterHits, gCfg.ocrExitHits,
         gCfg.ocrEnterStableMs, gCfg.ocrExitStableMs,
         gCfg.ocrProcessTimeoutMs,
         gCfg.ocrRegionXPct, gCfg.ocrRegionYPct, gCfg.ocrRegionWPct, gCfg.ocrRegionHPct,
-        gCfg.ocrPsm, gCfg.ocrDebugReasonOverlay,
+        gCfg.ocrPsm, gCfg.ocrDebugReasonOverlay, gCfg.ocrLogEveryMs,
         gCfg.ocrTesseractPath.c_str(), (int)gOcrKeywords.size());
     Log("[CFG] HUD: DrawMethod=%d HUDUiMode=%d ToastEnabled=%d ToastFallbackText=%d ToastIconDict='%s' ToastIcon='%s' ToastColor='%s' ToastDurationMs=%d ToastSoundSet='%s' ToastSound='%s'",
         gDrawMethod, gCfg.hudUiMode, gCfg.hudToastEnabled, gCfg.hudToastFallbackText,
