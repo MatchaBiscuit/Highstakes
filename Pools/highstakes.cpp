@@ -39,6 +39,10 @@
 #include <algorithm>
 #include <limits>
 #include <utility>
+#include <array>
+#include <deque>
+#include <unordered_set>
+#include <cmath>
 
 // ---------------- Logging ----------------
 static FILE* gLog = nullptr;
@@ -109,24 +113,39 @@ struct Settings
     int hudToastDurationMs = 450;
     std::string hudToastSoundSet = "";
     std::string hudToastSound = "";
+    int hudPanelX = 72;                 // percent
+    int hudPanelY = 35;                 // percent
+    float hudPanelLineStep = 2.2f;      // percent
+    int hudPanelMaxLines = 18;
 
     // -------- OCR detection --------
     int ocrEnabled = 1;
     int ocrIntervalMs = 1000;
-    int ocrEnterHits = 1;
-    int ocrExitHits = 1;
-    int ocrEnterStableMs = 600;
-    int ocrExitStableMs = 1800;
     int ocrProcessTimeoutMs = 2000;
-    int ocrRegionXPct = 0;
-    int ocrRegionYPct = 58;
-    int ocrRegionWPct = 100;
-    int ocrRegionHPct = 42;
+    int ocrBottomLeftXPct = 0;
+    int ocrBottomLeftYPct = 34;
+    int ocrBottomLeftWPct = 34;
+    int ocrBottomLeftHPct = 66;
+    int ocrTopRightXPct = 72;
+    int ocrTopRightYPct = 0;
+    int ocrTopRightWPct = 28;
+    int ocrTopRightHPct = 30;
     int ocrPsm = 11;
     int ocrDebugReasonOverlay = 0;
     int ocrLogEveryMs = 0;             // 0=disabled; otherwise logs OCR scan summaries
+    int ocrDumpArtifacts = 0;
+    int ocrPhaseStableMs = 1800;
+    int ocrOutStableMs = 4200;
+    float ocrPhaseConfThreshold = 0.62f;
+    int ocrOpacityHintEnable = 1;
+    int ocrOpacityRoiXPct = 72;
+    int ocrOpacityRoiYPct = 66;
+    int ocrOpacityRoiWPct = 27;
+    int ocrOpacityRoiHPct = 30;
+    float ocrOpacityLow = 8.0f;
+    float ocrOpacityHigh = 28.0f;
     std::string ocrTesseractPath = "tesseract";
-    std::string ocrKeywords = "poker,ante,call,fold,raise,check,bet,pot";
+    std::string ocrKeywords = "poker,ante,call,fold,raise,check,bet,pot,blind,cards,community,turn";
 
     // -------- Money sniffing (visual confirmation) --------
     int moneyOverlay = 1;               // 1=show money overlay while in poker
@@ -460,6 +479,48 @@ static void DrawLeftText(const char* msg, float x, float y)
     DrawTextBasic(msg, x, y, false);
 }
 
+static float ClampFloat(float v, float lo, float hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+struct HudPanelCursor
+{
+    float x = 0.72f;
+    float y = 0.35f;
+    float step = 0.022f;
+    int lines = 0;
+    int maxLines = 18;
+    bool clipped = false;
+};
+
+static HudPanelCursor MakeHudPanelCursor(float yOffsetNorm = 0.0f)
+{
+    HudPanelCursor c;
+    c.x = ClampFloat((float)gCfg.hudPanelX / 100.0f, 0.0f, 1.0f);
+    c.y = ClampFloat((float)gCfg.hudPanelY / 100.0f + yOffsetNorm, 0.0f, 1.0f);
+    c.step = ClampFloat(gCfg.hudPanelLineStep / 100.0f, 0.008f, 0.08f);
+    c.maxLines = gCfg.hudPanelMaxLines;
+    if (c.maxLines < 1) c.maxLines = 1;
+    if (c.maxLines > 128) c.maxLines = 128;
+    return c;
+}
+
+static bool DrawPanelLine(HudPanelCursor& c, const char* msg)
+{
+    if (c.lines >= c.maxLines)
+    {
+        c.clipped = true;
+        return false;
+    }
+    DrawLeftText(msg, c.x, c.y);
+    c.y += c.step;
+    c.lines++;
+    return true;
+}
+
 static bool HudUsesToastPath()
 {
     return gCfg.hudUiMode != HUD_UI_MODE_LEGACY_TEXT && gCfg.hudToastEnabled;
@@ -518,12 +579,41 @@ static void PostHudToast(const char* title, HudToastEventKind eventKind, DWORD n
 }
 
 // ---------------- Detection ----------------
+enum PokerPhase
+{
+    POKER_PHASE_OUT_OF_POKER = 0,
+    POKER_PHASE_TABLE_IDLE = 1,
+    POKER_PHASE_PLAYER_DECISION = 2,
+    POKER_PHASE_WAITING_ACTION = 3,
+    POKER_PHASE_SHOWDOWN_REVEAL = 4,
+    POKER_PHASE_PAYOUT_SETTLEMENT = 5,
+    POKER_PHASE_COUNT = 6
+};
+
+static const char* PokerPhaseToString(PokerPhase p)
+{
+    switch (p)
+    {
+    case POKER_PHASE_OUT_OF_POKER: return "OUT_OF_POKER";
+    case POKER_PHASE_TABLE_IDLE: return "TABLE_IDLE";
+    case POKER_PHASE_PLAYER_DECISION: return "PLAYER_DECISION";
+    case POKER_PHASE_WAITING_ACTION: return "WAITING_ACTION";
+    case POKER_PHASE_SHOWDOWN_REVEAL: return "SHOWDOWN_REVEAL";
+    case POKER_PHASE_PAYOUT_SETTLEMENT: return "PAYOUT_SETTLEMENT";
+    default: return "UNKNOWN";
+    }
+}
+
 struct DetectionInputs
 {
     bool scanOk = false;
     bool seenKeyword = false;
     int keywordHits = 0;
+    int anchorHits = 0;
     bool pending = false;
+    float opacityHint = 0.5f;
+    std::string rawText;
+    std::string normalizedText;
 };
 
 struct DetectionScore
@@ -531,13 +621,23 @@ struct DetectionScore
     int total = 0;
     bool gateFail = false;
     const char* gateReason = "ok";
+    PokerPhase guessPhase = POKER_PHASE_OUT_OF_POKER;
+    float confidence = 0.0f;
+    float opacityHint = 0.5f;
+    bool pokerAnchor = false;
+    DWORD candidateStableMs = 0;
+    std::array<float, POKER_PHASE_COUNT> phaseScores{};
+    std::string reasons;
 };
 
 struct DetectionRuntime
 {
     bool inPoker = false;
-    DWORD enterCandidateSince = 0;
-    DWORD exitCandidateSince = 0;
+    PokerPhase phase = POKER_PHASE_OUT_OF_POKER;
+    PokerPhase candidatePhase = POKER_PHASE_OUT_OF_POKER;
+    DWORD candidateSince = 0;
+    float phaseConfidence = 0.0f;
+    std::deque<std::array<float, POKER_PHASE_COUNT>> scoreHistory;
 };
 
 static DetectionInputs  gLastDetectInputs;
@@ -545,13 +645,18 @@ static DetectionScore   gLastDetectScore;
 static DetectionRuntime gDetectRuntime;
 static std::vector<std::string> gOcrKeywords;
 static std::string gLastOcrText;
-static char gOcrBmpPath[MAX_PATH]{ 0 };
-static char gOcrOutBasePath[MAX_PATH]{ 0 };
-static char gOcrTxtPath[MAX_PATH]{ 0 };
+static char gOcrBmpBottomLeftPath[MAX_PATH]{ 0 };
+static char gOcrBmpTopRightPath[MAX_PATH]{ 0 };
+static char gOcrOutBaseBottomLeftPath[MAX_PATH]{ 0 };
+static char gOcrOutBaseTopRightPath[MAX_PATH]{ 0 };
+static char gOcrTxtBottomLeftPath[MAX_PATH]{ 0 };
+static char gOcrTxtTopRightPath[MAX_PATH]{ 0 };
 static HANDLE gOcrProcess = nullptr;
 static DWORD gOcrProcessStartMs = 0;
 static DWORD gNextOcrStartAt = 0;
 static DWORD gNextOcrLogAt = 0;
+static float gPendingOpacityHint = 0.5f;
+static float gLastOpacityHint = 0.5f;
 
 static int ClampInt(int v, int lo, int hi)
 {
@@ -581,6 +686,235 @@ static std::string ToLowerAscii(std::string s)
             c = (char)(c - 'A' + 'a');
     }
     return s;
+}
+
+static std::string NormalizeOcrToken(const std::string& token)
+{
+    if (token == "comunity" || token == "communiry" || token == "communi" || token == "ommunity")
+        return "community";
+    if (token == "caros" || token == "cars" || token == "carns" || token == "car" || token == "card")
+        return "cards";
+    if (token == "calied" || token == "cailed")
+        return "called";
+    if (token == "fould" || token == "foid")
+        return "fold";
+    if (token == "checl" || token == "chec")
+        return "check";
+    if (token == "raisedd")
+        return "raised";
+    return token;
+}
+
+static std::string NormalizeOcrText(const std::string& text, std::unordered_map<std::string, int>& tokenCounts)
+{
+    tokenCounts.clear();
+    std::string flat;
+    flat.reserve(text.size());
+
+    for (char c : text)
+    {
+        unsigned char uc = (unsigned char)c;
+        if (uc >= 'A' && uc <= 'Z')
+            c = (char)(c - 'A' + 'a');
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '$')
+            flat.push_back(c);
+        else
+            flat.push_back(' ');
+    }
+
+    std::string out;
+    std::string tok;
+    for (size_t i = 0; i <= flat.size(); i++)
+    {
+        char c = (i < flat.size()) ? flat[i] : ' ';
+        if (c != ' ')
+        {
+            tok.push_back(c);
+            continue;
+        }
+
+        if (!tok.empty())
+        {
+            std::string norm = NormalizeOcrToken(tok);
+            if (norm.size() >= 2)
+            {
+                tokenCounts[norm]++;
+                if (!out.empty())
+                    out.push_back(' ');
+                out += norm;
+            }
+            tok.clear();
+        }
+    }
+    return out;
+}
+
+static bool HasToken(const std::unordered_map<std::string, int>& tokenCounts, const char* token)
+{
+    return tokenCounts.find(token) != tokenCounts.end();
+}
+
+static std::string BuildReasonSummary(std::vector<std::pair<float, std::string>>& reasons, int topN = 4)
+{
+    if (reasons.empty())
+        return "-";
+
+    std::sort(reasons.begin(), reasons.end(),
+        [](const std::pair<float, std::string>& a, const std::pair<float, std::string>& b) {
+            return a.first > b.first;
+        });
+
+    std::string out;
+    std::unordered_set<std::string> seen;
+    int used = 0;
+    for (const auto& r : reasons)
+    {
+        if (seen.count(r.second))
+            continue;
+        seen.insert(r.second);
+        if (!out.empty())
+            out += ",";
+        out += r.second;
+        used++;
+        if (used >= topN)
+            break;
+    }
+    if (out.empty())
+        out = "-";
+    return out;
+}
+
+static bool ComputeRegionLumaStdDev(HWND hwnd, int xPctIn, int yPctIn, int wPctIn, int hPctIn, float& outStdDev)
+{
+    outStdDev = 0.0f;
+
+    RECT rc{};
+    if (!GetClientRect(hwnd, &rc))
+        return false;
+
+    int cw = rc.right - rc.left;
+    int ch = rc.bottom - rc.top;
+    if (cw <= 0 || ch <= 0)
+        return false;
+
+    int xPct = ClampInt(xPctIn, 0, 100);
+    int yPct = ClampInt(yPctIn, 0, 100);
+    int wPct = ClampInt(wPctIn, 1, 100);
+    int hPct = ClampInt(hPctIn, 1, 100);
+
+    int x = (cw * xPct) / 100;
+    int y = (ch * yPct) / 100;
+    int w = (cw * wPct) / 100;
+    int h = (ch * hPct) / 100;
+    if (x + w > cw) w = cw - x;
+    if (y + h > ch) h = ch - y;
+    if (w <= 0 || h <= 0)
+        return false;
+
+    POINT p{ 0, 0 };
+    ClientToScreen(hwnd, &p);
+
+    HDC screen = GetDC(nullptr);
+    if (!screen)
+        return false;
+
+    HDC memdc = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, w, h);
+    if (!memdc || !bmp)
+    {
+        if (bmp) DeleteObject(bmp);
+        if (memdc) DeleteDC(memdc);
+        ReleaseDC(nullptr, screen);
+        return false;
+    }
+
+    HGDIOBJ old = SelectObject(memdc, bmp);
+    BOOL bltOk = BitBlt(memdc, 0, 0, w, h, screen, p.x + x, p.y + y, SRCCOPY);
+    if (old)
+        SelectObject(memdc, old);
+
+    bool ok = false;
+    if (bltOk)
+    {
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 24;
+        bi.bmiHeader.biCompression = BI_RGB;
+
+        int stride = ((w * 3 + 3) & ~3);
+        int dataSize = stride * h;
+        std::vector<unsigned char> pixels((size_t)dataSize);
+        if (GetDIBits(memdc, bmp, 0, (UINT)h, pixels.data(), &bi, DIB_RGB_COLORS))
+        {
+            double sum = 0.0;
+            double sumSq = 0.0;
+            int count = 0;
+            for (int yy = 0; yy < h; yy++)
+            {
+                const unsigned char* row = pixels.data() + yy * stride;
+                for (int xx = 0; xx < w; xx++)
+                {
+                    unsigned char b = row[xx * 3 + 0];
+                    unsigned char g = row[xx * 3 + 1];
+                    unsigned char r = row[xx * 3 + 2];
+                    double luma = 0.114 * b + 0.587 * g + 0.299 * r;
+                    sum += luma;
+                    sumSq += luma * luma;
+                    count++;
+                }
+            }
+            if (count > 0)
+            {
+                double mean = sum / count;
+                double var = (sumSq / count) - (mean * mean);
+                if (var < 0.0) var = 0.0;
+                outStdDev = (float)std::sqrt(var);
+                ok = true;
+            }
+        }
+    }
+
+    DeleteObject(bmp);
+    DeleteDC(memdc);
+    ReleaseDC(nullptr, screen);
+    return ok;
+}
+
+static float ComputeOpacityHint(HWND hwnd)
+{
+    if (!gCfg.ocrOpacityHintEnable)
+        return 0.5f;
+
+    float stddev = 0.0f;
+    if (!ComputeRegionLumaStdDev(
+        hwnd,
+        gCfg.ocrOpacityRoiXPct, gCfg.ocrOpacityRoiYPct,
+        gCfg.ocrOpacityRoiWPct, gCfg.ocrOpacityRoiHPct,
+        stddev))
+    {
+        return 0.5f;
+    }
+
+    float lo = gCfg.ocrOpacityLow;
+    float hi = gCfg.ocrOpacityHigh;
+    if (hi <= lo + 0.1f)
+        hi = lo + 0.1f;
+    float norm = (stddev - lo) / (hi - lo);
+    return ClampFloat(norm, 0.0f, 1.0f);
+}
+
+static void CleanupOcrArtifactsIfNeeded()
+{
+    if (gCfg.ocrDumpArtifacts)
+        return;
+
+    DeleteFileA(gOcrBmpBottomLeftPath);
+    DeleteFileA(gOcrBmpTopRightPath);
+    DeleteFileA(gOcrTxtBottomLeftPath);
+    DeleteFileA(gOcrTxtTopRightPath);
 }
 
 static const char* OcrStartFailReasonToString(OcrStartFailReason reason)
@@ -703,7 +1037,7 @@ static bool GetGameForegroundWindow(HWND& outHwnd)
     return pid == GetCurrentProcessId();
 }
 
-static bool CaptureOcrRegionToBmp(HWND hwnd)
+static bool CaptureOcrRegionToBmp(HWND hwnd, int xPctIn, int yPctIn, int wPctIn, int hPctIn, const char* outPath)
 {
     RECT rc{};
     if (!GetClientRect(hwnd, &rc))
@@ -714,10 +1048,10 @@ static bool CaptureOcrRegionToBmp(HWND hwnd)
     if (cw <= 0 || ch <= 0)
         return false;
 
-    int xPct = ClampInt(gCfg.ocrRegionXPct, 0, 100);
-    int yPct = ClampInt(gCfg.ocrRegionYPct, 0, 100);
-    int wPct = ClampInt(gCfg.ocrRegionWPct, 1, 100);
-    int hPct = ClampInt(gCfg.ocrRegionHPct, 1, 100);
+    int xPct = ClampInt(xPctIn, 0, 100);
+    int yPct = ClampInt(yPctIn, 0, 100);
+    int wPct = ClampInt(wPctIn, 1, 100);
+    int hPct = ClampInt(hPctIn, 1, 100);
 
     int x = (cw * xPct) / 100;
     int y = (ch * yPct) / 100;
@@ -753,7 +1087,7 @@ static bool CaptureOcrRegionToBmp(HWND hwnd)
 
     bool writeOk = false;
     if (bltOk)
-        writeOk = SaveBitmap24(gOcrBmpPath, bmp, memdc, w, h);
+        writeOk = SaveBitmap24(outPath, bmp, memdc, w, h);
 
     DeleteObject(bmp);
     DeleteDC(memdc);
@@ -811,24 +1145,52 @@ static bool StartOcrProcess(DWORD now)
         gLastOcrStartFailReason = OCR_START_FAIL_NO_FOREGROUND;
         return false;
     }
+    gPendingOpacityHint = ComputeOpacityHint(hwnd);
 
-    DeleteFileA(gOcrTxtPath);
-    if (!CaptureOcrRegionToBmp(hwnd))
+    DeleteFileA(gOcrTxtBottomLeftPath);
+    DeleteFileA(gOcrTxtTopRightPath);
+
+    if (!CaptureOcrRegionToBmp(
+        hwnd,
+        gCfg.ocrBottomLeftXPct, gCfg.ocrBottomLeftYPct,
+        gCfg.ocrBottomLeftWPct, gCfg.ocrBottomLeftHPct,
+        gOcrBmpBottomLeftPath))
     {
         gLastOcrStartFailReason = OCR_START_FAIL_CAPTURE;
         gLastOcrStartWinErr = GetLastError();
+        CleanupOcrArtifactsIfNeeded();
         return false;
     }
 
-    std::string cmd = "\"";
+    if (!CaptureOcrRegionToBmp(
+        hwnd,
+        gCfg.ocrTopRightXPct, gCfg.ocrTopRightYPct,
+        gCfg.ocrTopRightWPct, gCfg.ocrTopRightHPct,
+        gOcrBmpTopRightPath))
+    {
+        gLastOcrStartFailReason = OCR_START_FAIL_CAPTURE;
+        gLastOcrStartWinErr = GetLastError();
+        CleanupOcrArtifactsIfNeeded();
+        return false;
+    }
+
+    std::string cmd = "cmd /C \"\"";
     cmd += gCfg.ocrTesseractPath;
     cmd += "\" \"";
-    cmd += gOcrBmpPath;
+    cmd += gOcrBmpBottomLeftPath;
     cmd += "\" \"";
-    cmd += gOcrOutBasePath;
+    cmd += gOcrOutBaseBottomLeftPath;
     cmd += "\" --psm ";
     cmd += std::to_string(gCfg.ocrPsm);
-    cmd += " -l eng quiet";
+    cmd += " -l eng quiet && \"";
+    cmd += gCfg.ocrTesseractPath;
+    cmd += "\" \"";
+    cmd += gOcrBmpTopRightPath;
+    cmd += "\" \"";
+    cmd += gOcrOutBaseTopRightPath;
+    cmd += "\" --psm ";
+    cmd += std::to_string(gCfg.ocrPsm);
+    cmd += " -l eng quiet\"";
 
     STARTUPINFOA si{};
     si.cb = sizeof(si);
@@ -853,6 +1215,7 @@ static bool StartOcrProcess(DWORD now)
     {
         gLastOcrStartFailReason = OCR_START_FAIL_CREATE_PROCESS;
         gLastOcrStartWinErr = GetLastError();
+        CleanupOcrArtifactsIfNeeded();
         return false;
     }
 
@@ -879,6 +1242,7 @@ static bool TryCollectOcrResult(DWORD now, DetectionInputs& out, bool& hasResult
             StopOcrProcess(true);
             hasResult = true;
             out.scanOk = false;
+            CleanupOcrArtifactsIfNeeded();
         }
         else
         {
@@ -890,24 +1254,52 @@ static bool TryCollectOcrResult(DWORD now, DetectionInputs& out, bool& hasResult
     if (wait == WAIT_OBJECT_0)
     {
         StopOcrProcess(false);
-        std::string text;
-        if (!ReadTextFileAll(gOcrTxtPath, text))
+        std::string leftText;
+        std::string rightText;
+        bool leftOk = ReadTextFileAll(gOcrTxtBottomLeftPath, leftText);
+        bool rightOk = ReadTextFileAll(gOcrTxtTopRightPath, rightText);
+        if (!leftOk && !rightOk)
         {
             hasResult = true;
             out.scanOk = false;
             gLastOcrText.clear();
+            CleanupOcrArtifactsIfNeeded();
             return true;
+        }
+
+        std::string text;
+        if (leftOk)
+            text += leftText;
+        if (rightOk)
+        {
+            if (!text.empty())
+                text += "\n";
+            text += rightText;
         }
 
         text = ToLowerAscii(text);
         gLastOcrText = text;
+        out.rawText = text;
+        out.opacityHint = gPendingOpacityHint;
+        gLastOpacityHint = gPendingOpacityHint;
+        std::unordered_map<std::string, int> tokenCounts;
+        out.normalizedText = NormalizeOcrText(text, tokenCounts);
         out.scanOk = true;
         for (const auto& kw : gOcrKeywords)
         {
             if (!kw.empty() && text.find(kw) != std::string::npos)
                 out.keywordHits++;
         }
+        const char* anchors[] = {
+            "blind","cards","community","pot","call","fold","raise","bet",
+            "check","turn","pair","straight","flush","wins","amount",
+            "called","raised","folded","checked","skip","auto"
+        };
+        for (const char* anchor : anchors)
+            if (HasToken(tokenCounts, anchor))
+                out.anchorHits++;
         out.seenKeyword = (out.keywordHits > 0);
+        CleanupOcrArtifactsIfNeeded();
         hasResult = true;
         return true;
     }
@@ -916,12 +1308,14 @@ static bool TryCollectOcrResult(DWORD now, DetectionInputs& out, bool& hasResult
     StopOcrProcess(true);
     hasResult = true;
     out.scanOk = false;
+    CleanupOcrArtifactsIfNeeded();
     return true;
 }
 
 static DetectionScore ComputeDetectionScore(const DetectionInputs& in)
 {
     DetectionScore out;
+    out.opacityHint = in.opacityHint;
 
     if (!in.scanOk)
     {
@@ -932,48 +1326,205 @@ static DetectionScore ComputeDetectionScore(const DetectionInputs& in)
 
     out.total = in.keywordHits;
     out.gateReason = in.seenKeyword ? "ocrHit" : "ocrMiss";
+
+    std::unordered_map<std::string, int> tokens;
+    std::string normalized = in.normalizedText;
+    if (normalized.empty())
+        normalized = NormalizeOcrText(in.rawText, tokens);
+    else
+        (void)NormalizeOcrText(normalized, tokens);
+
+    std::string padded = " " + normalized + " ";
+    auto hasToken = [&](const char* t) { return HasToken(tokens, t); };
+    auto hasPhrase = [&](const char* p) {
+        std::string needle = " ";
+        needle += p;
+        needle += " ";
+        return padded.find(needle) != std::string::npos;
+    };
+
+    std::vector<std::pair<float, std::string>> reasons;
+    auto add = [&](PokerPhase p, float w, const char* why) {
+        out.phaseScores[(size_t)p] += w;
+        reasons.emplace_back(w, why);
+    };
+
+    // Table idle / seated markers.
+    if (hasPhrase("small blind")) add(POKER_PHASE_TABLE_IDLE, 2.2f, "small blind");
+    if (hasPhrase("big blind")) add(POKER_PHASE_TABLE_IDLE, 2.2f, "big blind");
+    if (hasToken("blind")) add(POKER_PHASE_TABLE_IDLE, 0.8f, "blind");
+    if (hasToken("pot")) add(POKER_PHASE_TABLE_IDLE, 1.2f, "pot");
+
+    // Active decision markers.
+    if (hasPhrase("your cards")) add(POKER_PHASE_PLAYER_DECISION, 2.4f, "your cards");
+    if (hasPhrase("take your turn")) add(POKER_PHASE_PLAYER_DECISION, 2.6f, "take your turn");
+    if (hasToken("call") || hasToken("called")) add(POKER_PHASE_PLAYER_DECISION, 1.1f, "call");
+    if (hasToken("fold") || hasToken("folded")) add(POKER_PHASE_PLAYER_DECISION, 1.1f, "fold");
+    if (hasToken("check") || hasToken("checked")) add(POKER_PHASE_PLAYER_DECISION, 1.1f, "check");
+    if (hasToken("raise") || hasToken("raised")) add(POKER_PHASE_PLAYER_DECISION, 1.1f, "raise");
+    if (hasToken("bet")) add(POKER_PHASE_PLAYER_DECISION, 1.1f, "bet");
+    if (hasToken("amount")) add(POKER_PHASE_PLAYER_DECISION, 0.9f, "amount");
+
+    // Waiting/auto-action markers.
+    if (hasToken("skip")) add(POKER_PHASE_WAITING_ACTION, 2.0f, "skip");
+    if (hasPhrase("auto bet")) add(POKER_PHASE_WAITING_ACTION, 2.2f, "auto bet");
+    if (hasToken("leave")) add(POKER_PHASE_WAITING_ACTION, 0.7f, "leave");
+    if (hasToken("waiting")) add(POKER_PHASE_WAITING_ACTION, 1.0f, "waiting");
+
+    // Reveal markers.
+    if (hasToken("pair")) add(POKER_PHASE_SHOWDOWN_REVEAL, 1.6f, "pair");
+    if (hasToken("straight")) add(POKER_PHASE_SHOWDOWN_REVEAL, 1.8f, "straight");
+    if (hasToken("flush")) add(POKER_PHASE_SHOWDOWN_REVEAL, 1.8f, "flush");
+    if (hasToken("muck")) add(POKER_PHASE_SHOWDOWN_REVEAL, 1.6f, "muck");
+    if (hasToken("reveal")) add(POKER_PHASE_SHOWDOWN_REVEAL, 1.4f, "reveal");
+    if (hasPhrase("waiting to reveal")) add(POKER_PHASE_SHOWDOWN_REVEAL, 2.2f, "waiting reveal");
+    if (hasPhrase("community cards")) add(POKER_PHASE_SHOWDOWN_REVEAL, 1.2f, "community cards");
+
+    // Payout markers.
+    if (in.rawText.find("wins $") != std::string::npos) add(POKER_PHASE_PAYOUT_SETTLEMENT, 3.0f, "wins $");
+    if (hasToken("wins")) add(POKER_PHASE_PAYOUT_SETTLEMENT, 1.8f, "wins");
+
+    // Opacity hint weighting (secondary signal only).
+    if (gCfg.ocrOpacityHintEnable)
+    {
+        if (in.opacityHint >= 0.70f)
+        {
+            add(POKER_PHASE_PLAYER_DECISION, 0.9f, "opacity:active");
+            add(POKER_PHASE_TABLE_IDLE, 0.3f, "opacity:active");
+        }
+        else if (in.opacityHint <= 0.30f)
+        {
+            add(POKER_PHASE_WAITING_ACTION, 0.6f, "opacity:faded");
+            add(POKER_PHASE_SHOWDOWN_REVEAL, 0.6f, "opacity:faded");
+            add(POKER_PHASE_PAYOUT_SETTLEMENT, 0.4f, "opacity:faded");
+        }
+    }
+
+    int anchorCount = in.anchorHits;
+    if (anchorCount <= 0)
+    {
+        const char* anchors[] = {
+            "blind","cards","community","pot","call","fold","raise","bet",
+            "check","turn","pair","straight","flush","wins","amount",
+            "called","raised","folded","checked","skip","auto"
+        };
+        for (const char* a : anchors)
+            if (hasToken(a))
+                anchorCount++;
+    }
+    out.pokerAnchor = anchorCount > 0;
+
+    float outScore = 0.4f;
+    if (!out.pokerAnchor)
+        outScore += 2.2f;
+    if (normalized.size() < 6)
+        outScore += 0.7f;
+    if (in.opacityHint < 0.25f)
+        outScore += 0.3f;
+    if (hasToken("leave"))
+        outScore += 0.4f;
+    out.phaseScores[(size_t)POKER_PHASE_OUT_OF_POKER] += outScore;
+
+    out.reasons = BuildReasonSummary(reasons);
     return out;
 }
 
-static bool UpdatePokerStateMachine(const DetectionScore& score, DWORD now)
+static bool IsPhaseTransitionAllowed(PokerPhase from, PokerPhase to)
 {
-    if (!gDetectRuntime.inPoker)
+    if (from == to)
+        return true;
+    if (to == POKER_PHASE_OUT_OF_POKER)
+        return true;
+    if (from == POKER_PHASE_OUT_OF_POKER)
+        return (to == POKER_PHASE_TABLE_IDLE || to == POKER_PHASE_PLAYER_DECISION || to == POKER_PHASE_WAITING_ACTION);
+    if (from == POKER_PHASE_SHOWDOWN_REVEAL)
+        return (to == POKER_PHASE_PAYOUT_SETTLEMENT || to == POKER_PHASE_TABLE_IDLE || to == POKER_PHASE_OUT_OF_POKER);
+    if (from == POKER_PHASE_PAYOUT_SETTLEMENT)
+        return (to == POKER_PHASE_TABLE_IDLE || to == POKER_PHASE_PLAYER_DECISION || to == POKER_PHASE_WAITING_ACTION || to == POKER_PHASE_OUT_OF_POKER);
+    return true;
+}
+
+static bool UpdatePokerStateMachine(DetectionScore& score, DWORD now)
+{
+    if (score.gateFail)
     {
-        if (!score.gateFail && score.total >= gCfg.ocrEnterHits)
-        {
-            if (gDetectRuntime.enterCandidateSince == 0)
-                gDetectRuntime.enterCandidateSince = now;
-            else if ((now - gDetectRuntime.enterCandidateSince) >= (DWORD)gCfg.ocrEnterStableMs)
-            {
-                gDetectRuntime.inPoker = true;
-                gDetectRuntime.enterCandidateSince = 0;
-                gDetectRuntime.exitCandidateSince = 0;
-            }
-        }
-        else
-        {
-            gDetectRuntime.enterCandidateSince = 0;
-        }
+        score.guessPhase = gDetectRuntime.phase;
+        score.confidence = gDetectRuntime.phaseConfidence;
+        score.candidateStableMs = 0;
+        return gDetectRuntime.inPoker;
     }
-    else
+
+    gDetectRuntime.scoreHistory.push_back(score.phaseScores);
+    while ((int)gDetectRuntime.scoreHistory.size() > 6)
+        gDetectRuntime.scoreHistory.pop_front();
+
+    std::array<float, POKER_PHASE_COUNT> smooth{};
+    for (const auto& s : gDetectRuntime.scoreHistory)
+        for (size_t i = 0; i < smooth.size(); i++)
+            smooth[i] += s[i];
+
+    float histN = (float)gDetectRuntime.scoreHistory.size();
+    if (histN <= 0.0f)
+        histN = 1.0f;
+    for (size_t i = 0; i < smooth.size(); i++)
+        smooth[i] /= histN;
+
+    int bestIdx = 0;
+    float bestScore = smooth[0];
+    float scoreSum = smooth[0];
+    for (int i = 1; i < POKER_PHASE_COUNT; i++)
     {
-        if (score.gateFail || score.total < gCfg.ocrExitHits)
+        scoreSum += smooth[i];
+        if (smooth[i] > bestScore)
         {
-            if (gDetectRuntime.exitCandidateSince == 0)
-                gDetectRuntime.exitCandidateSince = now;
-            else if ((now - gDetectRuntime.exitCandidateSince) >= (DWORD)gCfg.ocrExitStableMs)
-            {
-                gDetectRuntime.inPoker = false;
-                gDetectRuntime.enterCandidateSince = 0;
-                gDetectRuntime.exitCandidateSince = 0;
-            }
-        }
-        else
-        {
-            gDetectRuntime.exitCandidateSince = 0;
+            bestScore = smooth[i];
+            bestIdx = i;
         }
     }
 
+    if (scoreSum <= 0.0001f)
+        scoreSum = 0.0001f;
+
+    score.phaseScores = smooth;
+    score.guessPhase = (PokerPhase)bestIdx;
+    score.confidence = ClampFloat(bestScore / scoreSum, 0.0f, 1.0f);
+
+    if (gDetectRuntime.candidatePhase != score.guessPhase)
+    {
+        gDetectRuntime.candidatePhase = score.guessPhase;
+        gDetectRuntime.candidateSince = now;
+    }
+    score.candidateStableMs = (gDetectRuntime.candidateSince > 0) ? (now - gDetectRuntime.candidateSince) : 0;
+
+    bool shouldTransition = false;
+    if (score.guessPhase == POKER_PHASE_OUT_OF_POKER)
+    {
+        if (!score.pokerAnchor &&
+            score.confidence >= gCfg.ocrPhaseConfThreshold &&
+            score.candidateStableMs >= (DWORD)gCfg.ocrOutStableMs)
+        {
+            shouldTransition = true;
+        }
+    }
+    else if (score.confidence >= gCfg.ocrPhaseConfThreshold &&
+        score.pokerAnchor &&
+        score.candidateStableMs >= (DWORD)gCfg.ocrPhaseStableMs &&
+        IsPhaseTransitionAllowed(gDetectRuntime.phase, score.guessPhase))
+    {
+        shouldTransition = true;
+    }
+
+    if (shouldTransition && gDetectRuntime.phase != score.guessPhase)
+    {
+        Log("[PHASE] transition %s -> %s conf=%.2f",
+            PokerPhaseToString(gDetectRuntime.phase),
+            PokerPhaseToString(score.guessPhase),
+            score.confidence);
+        gDetectRuntime.phase = score.guessPhase;
+    }
+
+    gDetectRuntime.phaseConfidence = score.confidence;
+    gDetectRuntime.inPoker = (gDetectRuntime.phase != POKER_PHASE_OUT_OF_POKER);
     return gDetectRuntime.inPoker;
 }
 
@@ -1017,10 +1568,11 @@ static bool ComputeInPokerV2(DWORD now)
             if (gOcrStartFailureStreak >= 3 && !gOcrStartFailureWarned)
             {
                 gOcrStartFailureWarned = true;
-                Log("[OCR] WARNING: Failed to start OCR process repeatedly (reason=%s, winerr=%lu, region=(%d,%d,%d,%d), tesseract='%s').",
+                Log("[OCR] WARNING: Failed to start OCR process repeatedly (reason=%s, winerr=%lu, bl=(%d,%d,%d,%d), tr=(%d,%d,%d,%d), tesseract='%s').",
                     OcrStartFailReasonToString(gLastOcrStartFailReason),
                     (unsigned long)gLastOcrStartWinErr,
-                    gCfg.ocrRegionXPct, gCfg.ocrRegionYPct, gCfg.ocrRegionWPct, gCfg.ocrRegionHPct,
+                    gCfg.ocrBottomLeftXPct, gCfg.ocrBottomLeftYPct, gCfg.ocrBottomLeftWPct, gCfg.ocrBottomLeftHPct,
+                    gCfg.ocrTopRightXPct, gCfg.ocrTopRightYPct, gCfg.ocrTopRightWPct, gCfg.ocrTopRightHPct,
                     gCfg.ocrTesseractPath.c_str());
                 PostHudToast("OCR unavailable - check TesseractPath", HUD_TOAST_EVENT_OCR_UNAVAILABLE, now);
             }
@@ -1037,21 +1589,30 @@ static bool ComputeInPokerV2(DWORD now)
     DetectionScore score = ComputeDetectionScore(in);
     gLastDetectInputs = in;
     gLastDetectScore = score;
+    bool inPoker = UpdatePokerStateMachine(gLastDetectScore, now);
+    gLastDetectScore.opacityHint = in.opacityHint;
 
     if (gCfg.ocrLogEveryMs > 0 && now >= gNextOcrLogAt)
     {
         gNextOcrLogAt = now + (DWORD)gCfg.ocrLogEveryMs;
         std::string snippet = in.scanOk ? OcrTextLogSnippet(gLastOcrText, 96) : "";
-        Log("[OCR] scanOk=%d pending=%d hits=%d score=%d gate=%s text='%s'",
+        Log("[OCR] scanOk=%d pending=%d hits=%d anchors=%d score=%d gate=%s text='%s'",
             in.scanOk ? 1 : 0,
             in.pending ? 1 : 0,
             in.keywordHits,
-            score.total,
-            score.gateReason,
+            in.anchorHits,
+            gLastDetectScore.total,
+            gLastDetectScore.gateReason,
             snippet.c_str());
+        Log("[PHASE] guess=%s conf=%.2f stableMs=%lu opacity=%.2f reasons=%s",
+            PokerPhaseToString(gLastDetectScore.guessPhase),
+            gLastDetectScore.confidence,
+            (unsigned long)gLastDetectScore.candidateStableMs,
+            gLastDetectScore.opacityHint,
+            gLastDetectScore.reasons.empty() ? "-" : gLastDetectScore.reasons.c_str());
     }
 
-    return UpdatePokerStateMachine(score, now);
+    return inPoker;
 }
 // ---------------- Message + state ----------------
 static bool  gWasInPoker = false;
@@ -1081,6 +1642,10 @@ static void LoadSettings()
     gCfg.hudToastDurationMs  = IniGetInt("HUD", "ToastDurationMs", 450, gIniPath);
     gCfg.hudToastSoundSet    = IniGetString("HUD", "ToastSoundSet", "", gIniPath);
     gCfg.hudToastSound       = IniGetString("HUD", "ToastSound", "", gIniPath);
+    gCfg.hudPanelX           = IniGetInt("HUD", "PanelX", 72, gIniPath);
+    gCfg.hudPanelY           = IniGetInt("HUD", "PanelY", 35, gIniPath);
+    gCfg.hudPanelLineStep    = IniGetFloat("HUD", "PanelLineStep", 2.2f, gIniPath);
+    gCfg.hudPanelMaxLines    = IniGetInt("HUD", "PanelMaxLines", 18, gIniPath);
 
     bool hudCfgClamped = false;
     hudCfgClamped |= ClampSectionIntSetting("HUD", "DrawMethod", gDrawMethod, 1, 2);
@@ -1088,6 +1653,21 @@ static void LoadSettings()
     hudCfgClamped |= ClampSectionIntSetting("HUD", "ToastEnabled", gCfg.hudToastEnabled, 0, 1);
     hudCfgClamped |= ClampSectionIntSetting("HUD", "ToastFallbackText", gCfg.hudToastFallbackText, 0, 1);
     hudCfgClamped |= ClampSectionIntSetting("HUD", "ToastDurationMs", gCfg.hudToastDurationMs, 100, 10000);
+    hudCfgClamped |= ClampSectionIntSetting("HUD", "PanelX", gCfg.hudPanelX, 0, 100);
+    hudCfgClamped |= ClampSectionIntSetting("HUD", "PanelY", gCfg.hudPanelY, 0, 100);
+    hudCfgClamped |= ClampSectionIntSetting("HUD", "PanelMaxLines", gCfg.hudPanelMaxLines, 1, 128);
+    if (gCfg.hudPanelLineStep < 0.8f)
+    {
+        gCfg.hudPanelLineStep = 0.8f;
+        hudCfgClamped = true;
+        Log("[CFG] WARNING: HUD.PanelLineStep too small. Clamped to 0.8.");
+    }
+    else if (gCfg.hudPanelLineStep > 8.0f)
+    {
+        gCfg.hudPanelLineStep = 8.0f;
+        hudCfgClamped = true;
+        Log("[CFG] WARNING: HUD.PanelLineStep too large. Clamped to 8.0.");
+    }
 
     if (gCfg.hudToastIconDict.empty())
     {
@@ -1129,44 +1709,73 @@ static void LoadSettings()
     // OCR
     gCfg.ocrEnabled            = IniGetInt("OCR", "Enabled", 1, gIniPath);
     gCfg.ocrIntervalMs         = IniGetInt("OCR", "IntervalMs", 1000, gIniPath);
-    gCfg.ocrEnterHits          = IniGetInt("OCR", "EnterHits", 1, gIniPath);
-    gCfg.ocrExitHits           = IniGetInt("OCR", "ExitHits", 1, gIniPath);
-    gCfg.ocrEnterStableMs      = IniGetInt("OCR", "EnterStableMs", 600, gIniPath);
-    gCfg.ocrExitStableMs       = IniGetInt("OCR", "ExitStableMs", 1800, gIniPath);
     gCfg.ocrProcessTimeoutMs   = IniGetInt("OCR", "ProcessTimeoutMs", 2000, gIniPath);
-    gCfg.ocrRegionXPct         = IniGetInt("OCR", "RegionXPct", 0, gIniPath);
-    gCfg.ocrRegionYPct         = IniGetInt("OCR", "RegionYPct", 58, gIniPath);
-    gCfg.ocrRegionWPct         = IniGetInt("OCR", "RegionWPct", 100, gIniPath);
-    gCfg.ocrRegionHPct         = IniGetInt("OCR", "RegionHPct", 42, gIniPath);
+    gCfg.ocrBottomLeftXPct     = IniGetInt("OCR", "BottomLeftXPct", 0, gIniPath);
+    gCfg.ocrBottomLeftYPct     = IniGetInt("OCR", "BottomLeftYPct", 34, gIniPath);
+    gCfg.ocrBottomLeftWPct     = IniGetInt("OCR", "BottomLeftWPct", 34, gIniPath);
+    gCfg.ocrBottomLeftHPct     = IniGetInt("OCR", "BottomLeftHPct", 66, gIniPath);
+    gCfg.ocrTopRightXPct       = IniGetInt("OCR", "TopRightXPct", 72, gIniPath);
+    gCfg.ocrTopRightYPct       = IniGetInt("OCR", "TopRightYPct", 0, gIniPath);
+    gCfg.ocrTopRightWPct       = IniGetInt("OCR", "TopRightWPct", 28, gIniPath);
+    gCfg.ocrTopRightHPct       = IniGetInt("OCR", "TopRightHPct", 30, gIniPath);
     gCfg.ocrPsm                = IniGetInt("OCR", "PSM", 11, gIniPath);
-    gCfg.ocrDebugReasonOverlay = IniGetInt("OCR", "DebugReasonOverlay", 0, gIniPath);
+    gCfg.ocrDebugReasonOverlay = IniGetInt("OCR", "DebugReasonOverlay", 0, gIniPath); // compatibility key (forced off)
     gCfg.ocrLogEveryMs         = IniGetInt("OCR", "LogEveryMs", 0, gIniPath);
+    gCfg.ocrDumpArtifacts      = IniGetInt("OCR", "DumpArtifacts", 0, gIniPath);
+    gCfg.ocrPhaseStableMs      = IniGetInt("OCR", "PhaseStableMs", 1800, gIniPath);
+    gCfg.ocrOutStableMs        = IniGetInt("OCR", "OutStableMs", 4200, gIniPath);
+    gCfg.ocrPhaseConfThreshold = IniGetFloat("OCR", "PhaseConfThreshold", 0.62f, gIniPath);
+    gCfg.ocrOpacityHintEnable  = IniGetInt("OCR", "OpacityHintEnable", 1, gIniPath);
+    gCfg.ocrOpacityRoiXPct     = IniGetInt("OCR", "OpacityRoiXPct", 72, gIniPath);
+    gCfg.ocrOpacityRoiYPct     = IniGetInt("OCR", "OpacityRoiYPct", 66, gIniPath);
+    gCfg.ocrOpacityRoiWPct     = IniGetInt("OCR", "OpacityRoiWPct", 27, gIniPath);
+    gCfg.ocrOpacityRoiHPct     = IniGetInt("OCR", "OpacityRoiHPct", 30, gIniPath);
+    gCfg.ocrOpacityLow         = IniGetFloat("OCR", "OpacityLow", 8.0f, gIniPath);
+    gCfg.ocrOpacityHigh        = IniGetFloat("OCR", "OpacityHigh", 28.0f, gIniPath);
     gCfg.ocrTesseractPath      = IniGetString("OCR", "TesseractPath", "tesseract", gIniPath);
-    gCfg.ocrKeywords           = IniGetString("OCR", "Keywords", "poker,ante,call,fold,raise,check,bet,pot", gIniPath);
+    gCfg.ocrKeywords           = IniGetString("OCR", "Keywords", "poker,ante,call,fold,raise,check,bet,pot,blind,cards,community,turn", gIniPath);
 
     gCfg.ocrEnabled            = ClampInt(gCfg.ocrEnabled, 0, 1);
     gCfg.ocrIntervalMs         = ClampInt(gCfg.ocrIntervalMs, 200, 30000);
-    gCfg.ocrEnterHits          = ClampInt(gCfg.ocrEnterHits, 1, 32);
-    gCfg.ocrExitHits           = ClampInt(gCfg.ocrExitHits, 1, 32);
-    gCfg.ocrEnterStableMs      = ClampInt(gCfg.ocrEnterStableMs, 0, 10000);
-    gCfg.ocrExitStableMs       = ClampInt(gCfg.ocrExitStableMs, 0, 10000);
     gCfg.ocrProcessTimeoutMs   = ClampInt(gCfg.ocrProcessTimeoutMs, 250, 10000);
-    gCfg.ocrRegionXPct         = ClampInt(gCfg.ocrRegionXPct, 0, 100);
-    gCfg.ocrRegionYPct         = ClampInt(gCfg.ocrRegionYPct, 0, 100);
-    gCfg.ocrRegionWPct         = ClampInt(gCfg.ocrRegionWPct, 1, 100);
-    gCfg.ocrRegionHPct         = ClampInt(gCfg.ocrRegionHPct, 1, 100);
+    gCfg.ocrBottomLeftXPct     = ClampInt(gCfg.ocrBottomLeftXPct, 0, 100);
+    gCfg.ocrBottomLeftYPct     = ClampInt(gCfg.ocrBottomLeftYPct, 0, 100);
+    gCfg.ocrBottomLeftWPct     = ClampInt(gCfg.ocrBottomLeftWPct, 1, 100);
+    gCfg.ocrBottomLeftHPct     = ClampInt(gCfg.ocrBottomLeftHPct, 1, 100);
+    gCfg.ocrTopRightXPct       = ClampInt(gCfg.ocrTopRightXPct, 0, 100);
+    gCfg.ocrTopRightYPct       = ClampInt(gCfg.ocrTopRightYPct, 0, 100);
+    gCfg.ocrTopRightWPct       = ClampInt(gCfg.ocrTopRightWPct, 1, 100);
+    gCfg.ocrTopRightHPct       = ClampInt(gCfg.ocrTopRightHPct, 1, 100);
     gCfg.ocrPsm                = ClampInt(gCfg.ocrPsm, 3, 13);
-    gCfg.ocrDebugReasonOverlay = ClampInt(gCfg.ocrDebugReasonOverlay, 0, 1);
+    gCfg.ocrDebugReasonOverlay = 0;
     gCfg.ocrLogEveryMs         = ClampInt(gCfg.ocrLogEveryMs, 0, 60000);
+    gCfg.ocrDumpArtifacts      = ClampInt(gCfg.ocrDumpArtifacts, 0, 1);
+    gCfg.ocrPhaseStableMs      = ClampInt(gCfg.ocrPhaseStableMs, 250, 15000);
+    gCfg.ocrOutStableMs        = ClampInt(gCfg.ocrOutStableMs, 500, 30000);
+    gCfg.ocrOpacityHintEnable  = ClampInt(gCfg.ocrOpacityHintEnable, 0, 1);
+    gCfg.ocrOpacityRoiXPct     = ClampInt(gCfg.ocrOpacityRoiXPct, 0, 100);
+    gCfg.ocrOpacityRoiYPct     = ClampInt(gCfg.ocrOpacityRoiYPct, 0, 100);
+    gCfg.ocrOpacityRoiWPct     = ClampInt(gCfg.ocrOpacityRoiWPct, 1, 100);
+    gCfg.ocrOpacityRoiHPct     = ClampInt(gCfg.ocrOpacityRoiHPct, 1, 100);
+    gCfg.ocrPhaseConfThreshold = ClampFloat(gCfg.ocrPhaseConfThreshold, 0.20f, 0.95f);
+    gCfg.ocrOpacityLow         = ClampFloat(gCfg.ocrOpacityLow, 0.0f, 255.0f);
+    gCfg.ocrOpacityHigh        = ClampFloat(gCfg.ocrOpacityHigh, 0.0f, 255.0f);
+    if (gCfg.ocrOpacityHigh <= gCfg.ocrOpacityLow + 0.1f)
+        gCfg.ocrOpacityHigh = gCfg.ocrOpacityLow + 0.1f;
 
     BuildOcrKeywordList();
     StopOcrProcess(true);
     gNextOcrStartAt = 0;
     gNextOcrLogAt = 0;
+    gPendingOpacityHint = 0.5f;
+    gLastOpacityHint = 0.5f;
     gOcrStartFailureStreak = 0;
     gOcrStartFailureWarned = false;
     gLastOcrStartFailReason = OCR_START_FAIL_NONE;
     gLastOcrStartWinErr = 0;
+    gDetectRuntime = DetectionRuntime{};
+    gLastDetectInputs = DetectionInputs{};
+    gLastDetectScore = DetectionScore{};
     gHudToastNativeFailed = false;
     gHudToastNativeWarned = false;
     gLegacyHudMessage = "~COLOR_GOLD~Mod Online";
@@ -1251,18 +1860,22 @@ static void LoadSettings()
     Log("[CFG] PokerRadius=%.2f MsgMs=%d CooldownMs=%d CheckIntervalMs=%d DebugOverlay=%d",
         gCfg.pokerRadius, gCfg.msgDurationMs, gCfg.enterCooldownMs, gCfg.checkIntervalMs,
         gCfg.debugOverlay);
-    Log("[CFG] OCR: Enabled=%d IntervalMs=%d EnterHits=%d ExitHits=%d EnterStableMs=%d ExitStableMs=%d ProcTimeoutMs=%d Region=(%d,%d,%d,%d) PSM=%d DebugReason=%d LogEveryMs=%d Tesseract='%s' Keywords=%d",
+    Log("[CFG] OCR: Enabled=%d IntervalMs=%d ProcTimeoutMs=%d BL=(%d,%d,%d,%d) TR=(%d,%d,%d,%d) PSM=%d DebugReason=%d LogEveryMs=%d DumpArtifacts=%d PhaseStableMs=%d OutStableMs=%d PhaseConf=%.2f OpacityHint=%d OpacityROI=(%d,%d,%d,%d) OpacityRange=[%.1f..%.1f] Tesseract='%s' Keywords=%d",
         gCfg.ocrEnabled, gCfg.ocrIntervalMs,
-        gCfg.ocrEnterHits, gCfg.ocrExitHits,
-        gCfg.ocrEnterStableMs, gCfg.ocrExitStableMs,
         gCfg.ocrProcessTimeoutMs,
-        gCfg.ocrRegionXPct, gCfg.ocrRegionYPct, gCfg.ocrRegionWPct, gCfg.ocrRegionHPct,
-        gCfg.ocrPsm, gCfg.ocrDebugReasonOverlay, gCfg.ocrLogEveryMs,
+        gCfg.ocrBottomLeftXPct, gCfg.ocrBottomLeftYPct, gCfg.ocrBottomLeftWPct, gCfg.ocrBottomLeftHPct,
+        gCfg.ocrTopRightXPct, gCfg.ocrTopRightYPct, gCfg.ocrTopRightWPct, gCfg.ocrTopRightHPct,
+        gCfg.ocrPsm, gCfg.ocrDebugReasonOverlay, gCfg.ocrLogEveryMs, gCfg.ocrDumpArtifacts,
+        gCfg.ocrPhaseStableMs, gCfg.ocrOutStableMs, gCfg.ocrPhaseConfThreshold,
+        gCfg.ocrOpacityHintEnable,
+        gCfg.ocrOpacityRoiXPct, gCfg.ocrOpacityRoiYPct, gCfg.ocrOpacityRoiWPct, gCfg.ocrOpacityRoiHPct,
+        gCfg.ocrOpacityLow, gCfg.ocrOpacityHigh,
         gCfg.ocrTesseractPath.c_str(), (int)gOcrKeywords.size());
-    Log("[CFG] HUD: DrawMethod=%d HUDUiMode=%d ToastEnabled=%d ToastFallbackText=%d ToastIconDict='%s' ToastIcon='%s' ToastColor='%s' ToastDurationMs=%d ToastSoundSet='%s' ToastSound='%s'",
+    Log("[CFG] HUD: DrawMethod=%d HUDUiMode=%d ToastEnabled=%d ToastFallbackText=%d ToastIconDict='%s' ToastIcon='%s' ToastColor='%s' ToastDurationMs=%d Panel=(%d,%d) LineStep=%.2f MaxLines=%d ToastSoundSet='%s' ToastSound='%s'",
         gDrawMethod, gCfg.hudUiMode, gCfg.hudToastEnabled, gCfg.hudToastFallbackText,
         gCfg.hudToastIconDict.c_str(), gCfg.hudToastIcon.c_str(), gCfg.hudToastColor.c_str(),
-        gCfg.hudToastDurationMs, gCfg.hudToastSoundSet.c_str(), gCfg.hudToastSound.c_str());
+        gCfg.hudToastDurationMs, gCfg.hudPanelX, gCfg.hudPanelY, gCfg.hudPanelLineStep, gCfg.hudPanelMaxLines,
+        gCfg.hudToastSoundSet.c_str(), gCfg.hudToastSound.c_str());
 
     Log("[CFG] Money: Overlay=%d ScanEnable=%d Range=[%d..%d) Batch=%d IntervalMs=%d ValueRange=[%d..%d] TopN=%d PruneMs=%d",
         gCfg.moneyOverlay, gCfg.moneyScanEnable,
@@ -1298,9 +1911,9 @@ static void LoadSettings()
         gCfg.stackGlobal3, gCfg.stackGlobal4, gCfg.stackGlobal5);
 }
 
-static void DrawWatchLine(const char* label, int idx, float x, float& y)
+static bool DrawWatchLine(const char* label, int idx, HudPanelCursor& panel)
 {
-    if (idx < 0) return;
+    if (idx < 0) return true;
     int val = 0;
     bool ok = ReadGlobalInt(idx, val);
     char buf[128];
@@ -1308,8 +1921,7 @@ static void DrawWatchLine(const char* label, int idx, float x, float& y)
         _snprintf_s(buf, sizeof(buf), "%s [%d] = %d", label, idx, val);
     else
         _snprintf_s(buf, sizeof(buf), "%s [%d] = ???", label, idx);
-    DrawLeftText(buf, x, y);
-    y += 0.025f;
+    return DrawPanelLine(panel, buf);
 }
 
 // v0.5 OCR: Re-read all existing candidates and track value changes
@@ -1533,30 +2145,29 @@ static void MoneyTick(bool inPoker, DWORD now)
     }
 
     // ---- Draw overlay ----
-    float ox = 0.01f, oy = 0.40f;
+    HudPanelCursor panel = MakeHudPanelCursor();
     char buf[256];
 
     if (gCfg.hudUiMode >= HUD_UI_MODE_HYBRID_PANEL_TOASTS)
     {
-        DrawLeftText("Poker Scanner", ox, oy);
-        oy += 0.025f;
+        DrawPanelLine(panel, "Poker Scanner");
     }
 
     // Watch list (known globals)
-    DrawWatchLine("Pot", gCfg.potGlobal, ox, oy);
-    DrawWatchLine("Stk0", gCfg.stackGlobal0, ox, oy);
-    DrawWatchLine("Stk1", gCfg.stackGlobal1, ox, oy);
-    DrawWatchLine("Stk2", gCfg.stackGlobal2, ox, oy);
-    DrawWatchLine("Stk3", gCfg.stackGlobal3, ox, oy);
-    DrawWatchLine("Stk4", gCfg.stackGlobal4, ox, oy);
-    DrawWatchLine("Stk5", gCfg.stackGlobal5, ox, oy);
+    if (!DrawWatchLine("Pot", gCfg.potGlobal, panel)) return;
+    if (!DrawWatchLine("Stk0", gCfg.stackGlobal0, panel)) return;
+    if (!DrawWatchLine("Stk1", gCfg.stackGlobal1, panel)) return;
+    if (!DrawWatchLine("Stk2", gCfg.stackGlobal2, panel)) return;
+    if (!DrawWatchLine("Stk3", gCfg.stackGlobal3, panel)) return;
+    if (!DrawWatchLine("Stk4", gCfg.stackGlobal4, panel)) return;
+    if (!DrawWatchLine("Stk5", gCfg.stackGlobal5, panel)) return;
 
     // Scanner status
     _snprintf_s(buf, sizeof(buf), "Scanner idx=%d/%d cands=%d wraps=%d",
         gMoneyScanCursor, gCfg.moneyScanEnd,
         (int)gMoneyCands.size(), gMoneyScanWrapCount);
-    DrawLeftText(buf, ox, oy);
-    oy += 0.025f;
+    if (!DrawPanelLine(panel, buf))
+        return;
 
     // Top N candidates sorted by likely money behavior first.
     std::vector<const MoneyCandidate*> sorted;
@@ -1568,8 +2179,8 @@ static void MoneyTick(bool inPoker, DWORD now)
         const MoneyCandidate* c = sorted[i];
         _snprintf_s(buf, sizeof(buf), "C%02d idx=%d val=%d ($%.2f) chg=%d",
             i + 1, c->idx, c->last, (double)c->last / 100.0, c->changes);
-        DrawLeftText(buf, ox, oy);
-        oy += 0.022f;
+        if (!DrawPanelLine(panel, buf))
+            break;
     }
 }
 
@@ -1588,25 +2199,37 @@ static void InitPaths()
     DWORD tn = GetTempPathA(MAX_PATH, tempPath);
     if (tn > 0 && tn < MAX_PATH)
     {
-        strcpy_s(gOcrBmpPath, MAX_PATH, tempPath);
-        strcat_s(gOcrBmpPath, MAX_PATH, "highstakes_ocr.bmp");
+        strcpy_s(gOcrBmpBottomLeftPath, MAX_PATH, tempPath);
+        strcat_s(gOcrBmpBottomLeftPath, MAX_PATH, "highstakes_ocr_bl.bmp");
+        strcpy_s(gOcrBmpTopRightPath, MAX_PATH, tempPath);
+        strcat_s(gOcrBmpTopRightPath, MAX_PATH, "highstakes_ocr_tr.bmp");
 
-        strcpy_s(gOcrOutBasePath, MAX_PATH, tempPath);
-        strcat_s(gOcrOutBasePath, MAX_PATH, "highstakes_ocr");
+        strcpy_s(gOcrOutBaseBottomLeftPath, MAX_PATH, tempPath);
+        strcat_s(gOcrOutBaseBottomLeftPath, MAX_PATH, "highstakes_ocr_bl");
+        strcpy_s(gOcrOutBaseTopRightPath, MAX_PATH, tempPath);
+        strcat_s(gOcrOutBaseTopRightPath, MAX_PATH, "highstakes_ocr_tr");
 
-        strcpy_s(gOcrTxtPath, MAX_PATH, tempPath);
-        strcat_s(gOcrTxtPath, MAX_PATH, "highstakes_ocr.txt");
+        strcpy_s(gOcrTxtBottomLeftPath, MAX_PATH, tempPath);
+        strcat_s(gOcrTxtBottomLeftPath, MAX_PATH, "highstakes_ocr_bl.txt");
+        strcpy_s(gOcrTxtTopRightPath, MAX_PATH, tempPath);
+        strcat_s(gOcrTxtTopRightPath, MAX_PATH, "highstakes_ocr_tr.txt");
     }
     else
     {
-        strcpy_s(gOcrBmpPath, MAX_PATH, gIniPath);
-        strcat_s(gOcrBmpPath, MAX_PATH, "highstakes_ocr.bmp");
+        strcpy_s(gOcrBmpBottomLeftPath, MAX_PATH, gIniPath);
+        strcat_s(gOcrBmpBottomLeftPath, MAX_PATH, "highstakes_ocr_bl.bmp");
+        strcpy_s(gOcrBmpTopRightPath, MAX_PATH, gIniPath);
+        strcat_s(gOcrBmpTopRightPath, MAX_PATH, "highstakes_ocr_tr.bmp");
 
-        strcpy_s(gOcrOutBasePath, MAX_PATH, gIniPath);
-        strcat_s(gOcrOutBasePath, MAX_PATH, "highstakes_ocr");
+        strcpy_s(gOcrOutBaseBottomLeftPath, MAX_PATH, gIniPath);
+        strcat_s(gOcrOutBaseBottomLeftPath, MAX_PATH, "highstakes_ocr_bl");
+        strcpy_s(gOcrOutBaseTopRightPath, MAX_PATH, gIniPath);
+        strcat_s(gOcrOutBaseTopRightPath, MAX_PATH, "highstakes_ocr_tr");
 
-        strcpy_s(gOcrTxtPath, MAX_PATH, gIniPath);
-        strcat_s(gOcrTxtPath, MAX_PATH, "highstakes_ocr.txt");
+        strcpy_s(gOcrTxtBottomLeftPath, MAX_PATH, gIniPath);
+        strcat_s(gOcrTxtBottomLeftPath, MAX_PATH, "highstakes_ocr_bl.txt");
+        strcpy_s(gOcrTxtTopRightPath, MAX_PATH, gIniPath);
+        strcat_s(gOcrTxtTopRightPath, MAX_PATH, "highstakes_ocr_tr.txt");
     }
 }
 
@@ -1676,25 +2299,27 @@ static void Tick()
     // Debug overlay
     if (gCfg.debugOverlay)
     {
-        char dbg[256];
-        _snprintf_s(dbg, sizeof(dbg), "inPoker=%d score=%d gate=%s",
-            inPoker ? 1 : 0, gLastDetectScore.total, gLastDetectScore.gateReason);
-        DrawLeftText(dbg, 0.01f, 0.08f);
-    }
+        HudPanelCursor debugPanel = MakeHudPanelCursor(-2.5f * (gCfg.hudPanelLineStep / 100.0f));
+        if (debugPanel.y < 0.02f)
+            debugPanel.y = 0.02f;
 
-    // OCR debug reason overlay
-    if (gCfg.ocrDebugReasonOverlay)
-    {
         char dbg[256];
         _snprintf_s(dbg, sizeof(dbg),
-            "scan=%d pending=%d seen=%d hits=%d | score=%d gate=%s",
+            "inPoker=%d gate=%s phase=%s conf=%.2f",
+            inPoker ? 1 : 0,
+            gLastDetectScore.gateReason,
+            PokerPhaseToString(gLastDetectScore.guessPhase),
+            gLastDetectScore.confidence);
+        DrawPanelLine(debugPanel, dbg);
+
+        _snprintf_s(dbg, sizeof(dbg),
+            "scan=%d pending=%d hits=%d anchors=%d opacity=%.2f",
             gLastDetectInputs.scanOk ? 1 : 0,
             gLastDetectInputs.pending ? 1 : 0,
-            gLastDetectInputs.seenKeyword ? 1 : 0,
             gLastDetectInputs.keywordHits,
-            gLastDetectScore.total,
-            gLastDetectScore.gateReason);
-        DrawLeftText(dbg, 0.01f, 0.11f);
+            gLastDetectInputs.anchorHits,
+            gLastDetectScore.opacityHint);
+        DrawPanelLine(debugPanel, dbg);
     }
 
     // Money tick
